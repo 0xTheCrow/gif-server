@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: gifserver
+      POSTGRES_USER: gifserver
+      POSTGRES_PASSWORD: gifserver
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gifserver"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8847:8847"
+    environment:
+      DATABASE_URL: postgres://gifserver:gifserver@db:5432/gifserver
+      STORAGE_PATH: /app/storage
+      HOST: 0.0.0.0
+      PORT: 8847
+      BASE_URL: http://localhost:8847
+    volumes:
+      - gif_storage:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  gif_storage:
