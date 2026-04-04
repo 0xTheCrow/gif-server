@@ -1,8 +1,10 @@
 use gif_server::{AppState, config::Config, create_router};
 use sqlx::postgres::PgPoolOptions;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -48,13 +50,15 @@ async fn main() {
             .unwrap(),
     );
 
-    let app = create_router(state).layer(GovernorLayer::new(governor_conf));
+    let app = create_router(state)
+        .layer(GovernorLayer::new(governor_conf))
+        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any));
 
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
 }
 
 async fn add_api_key(name: &str) {

@@ -27,11 +27,10 @@ services:
       PORT: 8847
       BASE_URL: http://localhost:8847
     volumes:
-      - gif_storage:/app/storage
+      - ./storage:/app/storage
     depends_on:
       db:
         condition: service_healthy
 
 volumes:
   postgres_data:
-  gif_storage:
