@@ -41,6 +41,25 @@ pub async fn remove_favorite(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn add_hidden(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    require_viewable(&state, &id, &user).await?;
+    db::add_hidden(&state.pool, &user.mxid, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn remove_hidden(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    db::remove_hidden(&state.pool, &user.mxid, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list(
     state: &AppState,
     user: &AuthUser,
@@ -56,6 +75,9 @@ async fn list(
         }
         ListKind::History => {
             db::list_history(&state.pool, &user.mxid, params.grab_nsfw, limit, offset).await?
+        }
+        ListKind::Hidden => {
+            db::list_hidden(&state.pool, &user.mxid, params.grab_nsfw, limit, offset).await?
         }
     };
 
@@ -75,6 +97,7 @@ async fn list(
 enum ListKind {
     Favorites,
     History,
+    Hidden,
 }
 
 pub async fn list_favorites(
@@ -91,4 +114,12 @@ pub async fn list_history(
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<ListResponse>, AppError> {
     list(&state, &user, &params, ListKind::History).await
+}
+
+pub async fn list_hidden(
+    State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<ListResponse>, AppError> {
+    list(&state, &user, &params, ListKind::Hidden).await
 }

@@ -27,6 +27,13 @@ async fn main() {
         .await
         .expect("failed to connect to database");
 
+    // sqlx owns the schema: apply any pending migrations from ./migrations,
+    // tracked in _sqlx_migrations. Fail fast if a migration can't apply.
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .expect("failed to apply database migrations");
+
     // Reconcile on-disk bytes against the DB total so orphaned/missing files
     // surface in logs at startup.
     match files::dir_size(&config.storage_path) {

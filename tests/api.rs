@@ -1956,6 +1956,133 @@ async fn cannot_favorite_others_private_gif(pool: PgPool) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Hidden
+// ---------------------------------------------------------------------------
+
+async fn hide(app: &axum::Router, token: &str, id: &str, method: &str) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(format!("/gifs/{}/hide", id))
+                .header("Authorization", token)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn list_ids(app: &axum::Router, token: &str, uri: &str) -> Vec<String> {
+    ids(&body_json(
+        app.clone()
+            .oneshot(
+                Request::get(uri)
+                    .header("Authorization", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body(),
+    )
+    .await)
+}
+
+#[sqlx::test]
+async fn hidden_excluded_from_browse_unless_grab_hidden(pool: PgPool) {
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+    let tok = bearer(TEST_USER);
+    let id = upload_gif(&app, &tok, &make_gif(40, 40, 1), "hd1").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Visible everywhere before hiding.
+    assert!(list_ids(&app, &tok, "/gifs/search").await.contains(&id));
+    assert!(list_ids(&app, &tok, "/gifs/recent").await.contains(&id));
+    assert!(list_ids(&app, &tok, "/gifs/featured").await.contains(&id));
+
+    assert_eq!(hide(&app, &tok, &id, "PUT").await, StatusCode::NO_CONTENT);
+    // idempotent
+    assert_eq!(hide(&app, &tok, &id, "PUT").await, StatusCode::NO_CONTENT);
+
+    // Gone from every browse surface...
+    assert!(!list_ids(&app, &tok, "/gifs/search").await.contains(&id));
+    assert!(!list_ids(&app, &tok, "/gifs/recent").await.contains(&id));
+    assert!(!list_ids(&app, &tok, "/gifs/featured").await.contains(&id));
+
+    // ...but reachable when grab_hidden is set, and via the hidden list.
+    assert!(list_ids(&app, &tok, "/gifs/search?grab_hidden=true").await.contains(&id));
+    assert!(list_ids(&app, &tok, "/gifs/recent?grab_hidden=true").await.contains(&id));
+    assert!(list_ids(&app, &tok, "/gifs/hidden").await.contains(&id));
+
+    // Still reachable by direct id.
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::get(format!("/gifs/{}", id))
+                    .header("Authorization", &tok)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    assert_eq!(hide(&app, &tok, &id, "DELETE").await, StatusCode::NO_CONTENT);
+    assert!(list_ids(&app, &tok, "/gifs/search").await.contains(&id));
+    assert!(!list_ids(&app, &tok, "/gifs/hidden").await.contains(&id));
+}
+
+#[sqlx::test]
+async fn hiding_is_per_user(pool: PgPool) {
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+    let id = upload_gif(&app, &bearer(TEST_USER), &make_gif(40, 40, 1), "hd2").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        hide(&app, &bearer(TEST_USER), &id, "PUT").await,
+        StatusCode::NO_CONTENT
+    );
+
+    // The other user never hid it, so they still see it.
+    assert!(list_ids(&app, &bearer(TEST_OTHER), "/gifs/search").await.contains(&id));
+    assert!(!list_ids(&app, &bearer(TEST_USER), "/gifs/search").await.contains(&id));
+}
+
+#[sqlx::test]
+async fn cannot_hide_others_private_gif(pool: PgPool) {
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/gifs")
+                .header("Authorization", bearer(TEST_USER))
+                .header("Content-Type", "multipart/form-data; boundary=fp")
+                .body(Body::from(multipart_vis(&make_gif(40, 40, 1), "private", "fp")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let id = body_json(res.into_body()).await["id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        hide(&app, &bearer(TEST_OTHER), &id, "PUT").await,
+        StatusCode::NOT_FOUND
+    );
+}
+
 #[sqlx::test]
 async fn history_lists_recently_selected(pool: PgPool) {
     let (state, _dir) = make_state(pool);

@@ -168,6 +168,8 @@ GET  /gifs/:id/file                   — serve file (?rendition=original|previe
 POST /gifs/:id/select                 — record a selection: adds the GIF to your history and bumps the shared featured ranking (counted at most once per user per GIF per 24h)
 PUT    /gifs/:id/favorite             — add to your favorites (idempotent)
 DELETE /gifs/:id/favorite             — remove from your favorites
+PUT    /gifs/:id/hide                  — hide this GIF from your browsing (idempotent)
+DELETE /gifs/:id/hide                  — un-hide this GIF
 PATCH  /gifs/:id  {"visibility"?,"is_nsfw"?}  — update metadata; >=1 field required (uploader, or admin on shared)
 DELETE /gifs/:id                      — delete GIF and all rendition files (uploader, or admin on shared)
 ```
@@ -182,6 +184,7 @@ GET /gifs/search?q=cat+funny&limit=20&pos=<cursor>   — search by tags / filena
 GET /gifs/featured?limit=20&pos=<cursor>             — sorted by selection count
 GET /gifs/recent?limit=20&pos=<cursor>               — sorted by upload date
 GET /gifs/favorites?limit=20&pos=<cursor>            — your favorited GIFs, newest-first
+GET /gifs/hidden?limit=20&pos=<cursor>               — GIFs you've hidden, newest-first (to un-hide)
 GET /gifs/history?limit=20&pos=<cursor>              — GIFs you've selected, most-recently-used first
 GET /gifs/tags/suggest?q=ca&limit=10                 — tag autocomplete
 ```
@@ -192,6 +195,12 @@ restrict results to your own uploads. Add `&grab_nsfw=true` to include GIFs
 flagged NSFW; by default they are excluded from all listings (unconditionally —
 even from your own `&mine=true`, favorites, and history results). List/search
 results always exclude other users' private GIFs.
+
+GIFs you have hidden are excluded from `search`, `featured`, and `recent`
+unless you pass `&grab_hidden=true`. Hiding is per-user and never affects what
+anyone else sees. Hidden GIFs are still reachable by direct `GET /gifs/:id` and
+are always listed by `GET /gifs/hidden` (regardless of `grab_hidden`) so you
+can un-hide one undone by mistake.
 
 `tags/suggest` only suggests tags that appear on a shared, non-NSFW GIF — tags
 existing solely on private GIFs (anyone's, including yours) or NSFW GIFs are

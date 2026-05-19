@@ -66,6 +66,9 @@ pub struct SearchParams {
     /// When false (default) GIFs flagged NSFW are excluded.
     #[serde(default)]
     pub grab_nsfw: bool,
+    /// When false (default) GIFs the viewer has hidden are excluded.
+    #[serde(default)]
+    pub grab_hidden: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +80,9 @@ pub struct PaginationParams {
     /// When false (default) GIFs flagged NSFW are excluded.
     #[serde(default)]
     pub grab_nsfw: bool,
+    /// When false (default) GIFs the viewer has hidden are excluded.
+    #[serde(default)]
+    pub grab_hidden: bool,
 }
 
 #[derive(Debug, Deserialize)]

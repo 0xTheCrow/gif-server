@@ -43,10 +43,10 @@ pub async fn search(
             let terms: Vec<String> = q.split_whitespace()
                 .map(|t| t.to_lowercase())
                 .collect();
-            let mut results = db::search_by_tags(&state.pool, &terms, viewer, params.mine, params.grab_nsfw, limit, offset).await?;
+            let mut results = db::search_by_tags(&state.pool, &terms, viewer, params.mine, params.grab_nsfw, params.grab_hidden, limit, offset).await?;
             if (results.len() as i64) < limit {
                 let seen: std::collections::HashSet<String> = results.iter().map(|g| g.id.clone()).collect();
-                let fts = db::search_by_filename(&state.pool, q, viewer, params.mine, params.grab_nsfw, limit, offset).await?;
+                let fts = db::search_by_filename(&state.pool, q, viewer, params.mine, params.grab_nsfw, params.grab_hidden, limit, offset).await?;
                 for g in fts {
                     if !seen.contains(&g.id) {
                         results.push(g);
@@ -56,7 +56,7 @@ pub async fn search(
             }
             results
         }
-        None => db::list_recent(&state.pool, viewer, params.mine, params.grab_nsfw, limit, offset).await?,
+        None => db::list_recent(&state.pool, viewer, params.mine, params.grab_nsfw, params.grab_hidden, limit, offset).await?,
     };
 
     let next = if gifs.len() as i64 == limit {
@@ -81,7 +81,7 @@ pub async fn featured(
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let offset = decode_offset(params.pos.as_deref());
 
-    let gifs = db::list_featured(&state.pool, &user.mxid, params.mine, params.grab_nsfw, limit, offset).await?;
+    let gifs = db::list_featured(&state.pool, &user.mxid, params.mine, params.grab_nsfw, params.grab_hidden, limit, offset).await?;
     let next = if gifs.len() as i64 == limit { Some(encode_offset(offset + limit)) } else { None };
 
     let mut results = Vec::with_capacity(gifs.len());
@@ -100,7 +100,7 @@ pub async fn recent(
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let offset = decode_offset(params.pos.as_deref());
 
-    let gifs = db::list_recent(&state.pool, &user.mxid, params.mine, params.grab_nsfw, limit, offset).await?;
+    let gifs = db::list_recent(&state.pool, &user.mxid, params.mine, params.grab_nsfw, params.grab_hidden, limit, offset).await?;
     let next = if gifs.len() as i64 == limit { Some(encode_offset(offset + limit)) } else { None };
 
     let mut results = Vec::with_capacity(gifs.len());

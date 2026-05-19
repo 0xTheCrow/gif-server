@@ -79,6 +79,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/gifs/{id}/select",    post(routes::fetch::select_gif))
         .route("/gifs/{id}/favorite",  put(routes::favorites::add_favorite)
                                        .delete(routes::favorites::remove_favorite))
+        .route("/gifs/{id}/hide",      put(routes::favorites::add_hidden)
+                                       .delete(routes::favorites::remove_hidden))
         .route("/gifs/{id}/tags",      put(routes::tags::put_tags)
                                        .patch(routes::tags::patch_tags)
                                        .delete(routes::tags::delete_tags))
@@ -86,6 +88,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/gifs/featured",       get(routes::search::featured))
         .route("/gifs/recent",         get(routes::search::recent))
         .route("/gifs/favorites",      get(routes::favorites::list_favorites))
+        .route("/gifs/hidden",         get(routes::favorites::list_hidden))
         .route("/gifs/history",        get(routes::favorites::list_history))
         .route("/gifs/tags/suggest",   get(routes::search::suggest))
         // Governor is added before the session layer so it ends up *inside*

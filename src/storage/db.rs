@@ -25,6 +25,20 @@ fn list_filters(mine: bool, grab_nsfw: bool, alias: &str, param: &str) -> String
     clause
 }
 
+/// SQL fragment (a leading ` AND ...`) excluding GIFs the viewer has hidden,
+/// unless `grab_hidden`. `alias` is the gifs table alias, `viewer_param` the
+/// bind placeholder for the viewer mxid (reused, no extra bind).
+fn hidden_clause(grab_hidden: bool, alias: &str, viewer_param: &str) -> String {
+    if grab_hidden {
+        String::new()
+    } else {
+        format!(
+            " AND NOT EXISTS (SELECT 1 FROM hidden h \
+             WHERE h.gif_id = {alias}.id AND h.mxid = {viewer_param})"
+        )
+    }
+}
+
 pub async fn get_gif(pool: &PgPool, id: &str) -> Result<Option<Gif>, AppError> {
     Ok(sqlx::query_as::<_, Gif>(
         &format!("SELECT {GIF_COLS} FROM gifs WHERE id = $1")
@@ -256,6 +270,7 @@ pub async fn search_by_tags(
     viewer: &str,
     mine: bool,
     grab_nsfw: bool,
+    grab_hidden: bool,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<Gif>, AppError> {
@@ -264,12 +279,13 @@ pub async fn search_by_tags(
         .map(|t| format!("{}%", t.replace('%', "").replace('_', "")))
         .collect();
     let vis = list_filters(mine, grab_nsfw, "g", "$4");
+    let hidden = hidden_clause(grab_hidden, "g", "$4");
     Ok(sqlx::query_as::<_, Gif>(&format!(
         r#"SELECT g.id, g.filename, g.hash, g.uploader_id, g.visibility, g.is_nsfw,
                   g.frame_count, g.duration_ms, g.uses, g.uploaded_at
            FROM gifs g
            JOIN tags t ON t.gif_id = g.id
-           WHERE t.tag LIKE ANY($1) AND {vis}
+           WHERE t.tag LIKE ANY($1) AND {vis}{hidden}
            GROUP BY g.id
            ORDER BY COUNT(t.tag) DESC, g.uses DESC, g.uploaded_at DESC
            LIMIT $2 OFFSET $3"#
@@ -285,15 +301,17 @@ pub async fn search_by_filename(
     viewer: &str,
     mine: bool,
     grab_nsfw: bool,
+    grab_hidden: bool,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<Gif>, AppError> {
     let vis = list_filters(mine, grab_nsfw, "gifs", "$4");
+    let hidden = hidden_clause(grab_hidden, "gifs", "$4");
     Ok(sqlx::query_as::<_, Gif>(&format!(
         r#"SELECT {GIF_COLS}
            FROM gifs
            WHERE to_tsvector('english', filename) @@ plainto_tsquery('english', $1)
-             AND {vis}
+             AND {vis}{hidden}
            ORDER BY ts_rank(to_tsvector('english', filename), plainto_tsquery('english', $1)) DESC,
                     uses DESC
            LIMIT $2 OFFSET $3"#
@@ -308,12 +326,14 @@ pub async fn list_featured(
     viewer: &str,
     mine: bool,
     grab_nsfw: bool,
+    grab_hidden: bool,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<Gif>, AppError> {
     let vis = list_filters(mine, grab_nsfw, "gifs", "$3");
+    let hidden = hidden_clause(grab_hidden, "gifs", "$3");
     Ok(sqlx::query_as::<_, Gif>(&format!(
-        "SELECT {GIF_COLS} FROM gifs WHERE {vis}
+        "SELECT {GIF_COLS} FROM gifs WHERE {vis}{hidden}
          ORDER BY uses DESC, uploaded_at DESC LIMIT $1 OFFSET $2"
     ))
     .bind(limit).bind(offset).bind(viewer)
@@ -326,12 +346,14 @@ pub async fn list_recent(
     viewer: &str,
     mine: bool,
     grab_nsfw: bool,
+    grab_hidden: bool,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<Gif>, AppError> {
     let vis = list_filters(mine, grab_nsfw, "gifs", "$3");
+    let hidden = hidden_clause(grab_hidden, "gifs", "$3");
     Ok(sqlx::query_as::<_, Gif>(&format!(
-        "SELECT {GIF_COLS} FROM gifs WHERE {vis}
+        "SELECT {GIF_COLS} FROM gifs WHERE {vis}{hidden}
          ORDER BY uploaded_at DESC LIMIT $1 OFFSET $2"
     ))
     .bind(limit).bind(offset).bind(viewer)
@@ -379,6 +401,24 @@ pub async fn add_favorite(pool: &PgPool, mxid: &str, gif_id: &str) -> Result<(),
 
 pub async fn remove_favorite(pool: &PgPool, mxid: &str, gif_id: &str) -> Result<(), AppError> {
     sqlx::query("DELETE FROM favorites WHERE mxid = $1 AND gif_id = $2")
+        .bind(mxid).bind(gif_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn add_hidden(pool: &PgPool, mxid: &str, gif_id: &str) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO hidden (mxid, gif_id) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+    )
+    .bind(mxid).bind(gif_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn remove_hidden(pool: &PgPool, mxid: &str, gif_id: &str) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM hidden WHERE mxid = $1 AND gif_id = $2")
         .bind(mxid).bind(gif_id)
         .execute(pool)
         .await?;
@@ -446,6 +486,31 @@ pub async fn list_favorites(
          JOIN favorites f ON f.gif_id = g.id
          WHERE f.mxid = $3 AND {filters}
          ORDER BY f.created_at DESC
+         LIMIT $1 OFFSET $2"
+    ))
+    .bind(limit).bind(offset).bind(viewer)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// The viewer's hidden GIFs, newest first. This is the management view used
+/// to un-hide, so it ignores the hidden filter by design; it still respects
+/// visibility (a GIF turned private by its uploader stays unreachable).
+pub async fn list_hidden(
+    pool: &PgPool,
+    viewer: &str,
+    grab_nsfw: bool,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Gif>, AppError> {
+    let filters = list_filters(false, grab_nsfw, "g", "$3");
+    Ok(sqlx::query_as::<_, Gif>(&format!(
+        "SELECT g.id, g.filename, g.hash, g.uploader_id, g.visibility, g.is_nsfw,
+                g.frame_count, g.duration_ms, g.uses, g.uploaded_at
+         FROM gifs g
+         JOIN hidden hd ON hd.gif_id = g.id
+         WHERE hd.mxid = $3 AND {filters}
+         ORDER BY hd.created_at DESC
          LIMIT $1 OFFSET $2"
     ))
     .bind(limit).bind(offset).bind(viewer)
