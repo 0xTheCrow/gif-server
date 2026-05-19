@@ -1,7 +1,7 @@
 CREATE TABLE gifs (
     id          TEXT PRIMARY KEY,
     filename    TEXT NOT NULL,
-    hash        TEXT NOT NULL UNIQUE,
+    hash        TEXT NOT NULL,
     uploader_id TEXT NOT NULL,
     visibility  TEXT NOT NULL DEFAULT 'shared'
                 CHECK (visibility IN ('shared', 'private')),
@@ -9,7 +9,8 @@ CREATE TABLE gifs (
     frame_count INTEGER NOT NULL DEFAULT 1,
     duration_ms INTEGER NOT NULL DEFAULT 0,
     uses        BIGINT NOT NULL DEFAULT 0,
-    uploaded_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    uploaded_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (uploader_id, hash)
 );
 
 CREATE TABLE gif_renditions (

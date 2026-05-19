@@ -36,6 +36,7 @@ fn test_config(storage_path: String, max_bytes: u64) -> Config {
         admin_mxids: vec![TEST_ADMIN.to_string()],
         session_secret: TEST_SECRET.to_string(),
         storage_max_bytes: max_bytes,
+        per_user_storage_bytes: max_bytes,
         cors_allowed_origins: vec![],
     }
 }
@@ -2071,4 +2072,160 @@ async fn suggest_excludes_private_and_nsfw_tags(pool: PgPool) {
     let with_nsfw = suggest_tags_req(&app, &tok, "q=sug&grab_nsfw=true").await;
     assert!(with_nsfw.contains(&"sugbeta".to_string()));
     assert!(!with_nsfw.contains(&"suggamma".to_string()), "private tag leaked: {with_nsfw:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Per-user quota + per-uploader dedup + auth rate limit
+// ---------------------------------------------------------------------------
+
+fn make_state_user_cap(pool: PgPool, per_user: u64) -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(dir.path().to_str().unwrap().to_string(), u64::MAX);
+    cfg.per_user_storage_bytes = per_user;
+    let state = AppState {
+        pool,
+        config: Arc::new(cfg),
+        http: reqwest::Client::new(),
+    };
+    (state, dir)
+}
+
+#[sqlx::test]
+async fn per_user_quota_exceeded_returns_507(pool: PgPool) {
+    // Global cap unlimited, per-user cap 1 byte -> first upload rejected.
+    let (state, _dir) = make_state_user_cap(pool, 1);
+    let app = create_router(state);
+
+    let res = app
+        .oneshot(
+            Request::post("/gifs")
+                .header("Authorization", bearer(TEST_USER))
+                .header("Content-Type", "multipart/form-data; boundary=pq")
+                .body(Body::from(multipart_body(&make_gif(50, 50, 2), None, "pq")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INSUFFICIENT_STORAGE);
+}
+
+#[sqlx::test]
+async fn identical_file_from_different_users_is_not_deduped(pool: PgPool) {
+    // L1: dedup is per-uploader. The same bytes uploaded by another user
+    // create a distinct GIF (no 403 oracle, no shared row).
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+    let gif = make_gif(48, 48, 1);
+
+    let a = upload_gif(&app, &bearer(TEST_USER), &gif, "d1").await;
+    let a_id = a["id"].as_str().unwrap().to_string();
+    assert_eq!(a["uploader_id"], TEST_USER);
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/gifs")
+                .header("Authorization", bearer(TEST_OTHER))
+                .header("Content-Type", "multipart/form-data; boundary=d2")
+                .body(Body::from(multipart_body(&gif, None, "d2")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED); // not 200-dup, not 403
+    let b = body_json(res.into_body()).await;
+    assert_ne!(b["id"].as_str().unwrap(), a_id);
+    assert_eq!(b["uploader_id"], TEST_OTHER);
+
+    // Same user re-uploading the same bytes still dedups (200).
+    let again = app
+        .oneshot(
+            Request::post("/gifs")
+                .header("Authorization", bearer(TEST_USER))
+                .header("Content-Type", "multipart/form-data; boundary=d3")
+                .body(Body::from(multipart_body(&gif, None, "d3")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::OK);
+    assert_eq!(body_json(again.into_body()).await["id"].as_str().unwrap(), a_id);
+}
+
+#[sqlx::test]
+async fn auth_matrix_is_rate_limited(pool: PgPool) {
+    // Global limiter on /auth/matrix: burst 10, so a rapid 11th request is
+    // rejected with 429 before reaching verification.
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+
+    let mut saw_429 = false;
+    for _ in 0..15 {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/auth/matrix")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        r#"{"access_token":"x","matrix_server_name":"test.server"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if res.status() == StatusCode::TOO_MANY_REQUESTS {
+            saw_429 = true;
+            break;
+        }
+    }
+    assert!(saw_429, "expected a 429 within the burst window");
+}
+
+#[sqlx::test]
+async fn repeated_select_counts_uses_once_per_user(pool: PgPool) {
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+    let id = upload_gif(&app, &bearer(TEST_USER), &make_gif(40, 40, 1), "u1").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let select = |tok: String, app: axum::Router, id: String| async move {
+        app.oneshot(
+            Request::post(format!("/gifs/{}/select", id))
+                .header("Authorization", tok)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    };
+
+    // Same user selecting three times only counts once (within 24h).
+    for _ in 0..3 {
+        assert_eq!(
+            select(bearer(TEST_USER), app.clone(), id.clone()).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+    // A different user's selection counts separately.
+    assert_eq!(
+        select(bearer(TEST_OTHER), app.clone(), id.clone()).await,
+        StatusCode::NO_CONTENT
+    );
+
+    let json = body_json(
+        app.oneshot(
+            Request::get(format!("/gifs/{}", id))
+                .header("Authorization", bearer(TEST_USER))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body(),
+    )
+    .await;
+    assert_eq!(json["uses"], 2); // TEST_USER once + TEST_OTHER once
 }

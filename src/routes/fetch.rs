@@ -151,7 +151,8 @@ pub async fn select_gif(
     Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     load_viewable(&state, &id, &user).await?;
-    db::increment_uses(&state.pool, &id).await?;
-    db::record_selection(&state.pool, &user.mxid, &id).await?;
+    if db::record_selection(&state.pool, &user.mxid, &id).await? {
+        db::increment_uses(&state.pool, &id).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }

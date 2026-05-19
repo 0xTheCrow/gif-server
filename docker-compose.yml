@@ -31,6 +31,7 @@ services:
       MATRIX_ADMIN_MXIDS: "@you:example.com"
       SESSION_SECRET: change-me-to-a-long-random-string
       STORAGE_MAX_BYTES: 10GB
+      PER_USER_STORAGE_BYTES: 1GB
       CORS_ALLOWED_ORIGINS: ""
     volumes:
       - ./storage:/app/storage

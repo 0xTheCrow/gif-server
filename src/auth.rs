@@ -68,7 +68,11 @@ pub async fn verify_openid_token(
         .query(&[("access_token", token.access_token.as_str())])
         .send()
         .await
-        .map_err(|e| AppError::Internal(format!("openid verification request failed: {e}")))?;
+        // without_url() strips the URL, which carries the access_token in a
+        // query param, out of the error before it reaches the logs.
+        .map_err(|e| AppError::Internal(format!(
+            "openid verification request failed: {}", e.without_url()
+        )))?;
 
     if !resp.status().is_success() {
         return Err(AppError::Unauthorized);
@@ -77,7 +81,9 @@ pub async fn verify_openid_token(
     let info: UserInfo = resp
         .json()
         .await
-        .map_err(|e| AppError::Internal(format!("openid userinfo decode failed: {e}")))?;
+        .map_err(|e| AppError::Internal(format!(
+            "openid userinfo decode failed: {}", e.without_url()
+        )))?;
 
     let expected_suffix = format!(":{}", config.matrix_server_name);
     if !info.sub.starts_with('@') || !info.sub.ends_with(&expected_suffix) {

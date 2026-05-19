@@ -10,11 +10,12 @@ A self-hosted GIF server with tag-based search, modeled after the Tenor API. Wri
 - Autocomplete tag suggestions
 - Featured (sorted by selections) and recent endpoints
 - Cursor-based pagination
-- File deduplication via SHA-256
+- Per-uploader file deduplication via SHA-256
 - Matrix identity auth — users authenticate with a Matrix OpenID token from a trusted homeserver
 - Per-user uploads with shared/private visibility; owner + admin moderation
 - Total storage size cap
-- Per-IP rate limiting (60 req/s, burst 30)
+- Per-user rate limiting; strict global limit on the unauthenticated auth endpoint
+- Global and per-user storage quotas
 
 ## Requirements
 
@@ -93,8 +94,9 @@ All configuration is via environment variables (or `.env`):
 | `MATRIX_SERVER_NAME` | — | Trusted homeserver name, e.g. `example.com` (required) |
 | `MATRIX_FEDERATION_URL` | — | Where the homeserver federation API is reachable for OpenID verification, e.g. `https://example.com:8448` (required) |
 | `MATRIX_ADMIN_MXIDS` | _(empty)_ | Comma-separated admin Matrix IDs |
-| `SESSION_SECRET` | — | HMAC secret for signing session tokens (required) |
-| `STORAGE_MAX_BYTES` | `10GB` | Max total rendition bytes; suffix `KB`/`MB`/`GB`/`TB`, `0` disables |
+| `SESSION_SECRET` | — | HMAC secret for signing session tokens (required, min 32 chars) |
+| `STORAGE_MAX_BYTES` | `10GB` | Max total rendition bytes across all users; suffix `KB`/`MB`/`GB`/`TB`, `0` disables |
+| `PER_USER_STORAGE_BYTES` | `1GB` | Max rendition bytes per uploader; same suffixes, `0` disables |
 | `CORS_ALLOWED_ORIGINS` | _(empty)_ | Comma-separated allowed browser origins (e.g. `https://durnible.example.com`). Empty allows any origin with a startup warning — set this in production |
 
 Set `BASE_URL` to your public domain in production (e.g. `https://gifs.example.com`).
@@ -124,6 +126,10 @@ All endpoints except `POST /auth/matrix` and `GET /health` require an
 `Authorization: Bearer <session-jwt>` header. `GET /health` is an
 unauthenticated probe returning `200` if the database is reachable, else `503`.
 
+Authenticated endpoints are rate-limited per Matrix user (≈30 req/s, burst 60);
+`POST /auth/matrix` has a strict global limit (burst 10). Exceeding a limit
+returns `429 Too Many Requests`.
+
 A GIF is **shared** (visible to everyone) or **private** (visible only to its
 uploader), and may be flagged **NSFW** (`is_nsfw`). NSFW GIFs are excluded
 from all listings unless `grab_nsfw=true`, but are still returned by a direct
@@ -144,16 +150,22 @@ Fields:
   nsfw       — "true"/"1"/"yes" to flag NSFW (optional, default false)
 ```
 
-Returns `201 Created` with GIF metadata. Returns `200 OK` if the file was
-already uploaded (deduplicated by content hash). Returns `507 Insufficient
-Storage` if the upload would exceed `STORAGE_MAX_BYTES`.
+Returns `201 Created` with GIF metadata. Returns `200 OK` if **you** already
+uploaded this file (dedup is per-uploader by content hash — another user
+uploading the same bytes gets their own independent GIF, and cannot tell
+whether anyone else has it). Returns `507 Insufficient Storage` if the upload
+would exceed `STORAGE_MAX_BYTES` or your `PER_USER_STORAGE_BYTES`. Returns
+`400` if the
+GIF exceeds 4096×4096, 1000 frames, or 250M total pixels (width·height·frames)
+— bounds that keep decoding cost bounded. Decoding/resizing runs off the async
+runtime so a large upload can't stall other requests.
 
 ### Fetch
 
 ```
 GET  /gifs/:id                        — metadata + rendition URLs
 GET  /gifs/:id/file                   — serve file (?rendition=original|preview|thumbnail)
-POST /gifs/:id/select                 — record a selection: bumps the shared featured ranking and adds the GIF to your personal history
+POST /gifs/:id/select                 — record a selection: adds the GIF to your history and bumps the shared featured ranking (counted at most once per user per GIF per 24h)
 PUT    /gifs/:id/favorite             — add to your favorites (idempotent)
 DELETE /gifs/:id/favorite             — remove from your favorites
 PATCH  /gifs/:id  {"visibility"?,"is_nsfw"?}  — update metadata; >=1 field required (uploader, or admin on shared)

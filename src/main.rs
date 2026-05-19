@@ -1,9 +1,7 @@
 use axum::http::{header, HeaderValue, Method};
 use gif_server::{config::Config, create_router, storage::files, AppState};
 use sqlx::postgres::PgPoolOptions;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -50,19 +48,19 @@ async fn main() {
         Err(e) => tracing::warn!("could not measure storage directory: {}", e),
     }
 
+    // OpenID verification is reachable unauthenticated via POST /auth/matrix;
+    // bound it so a slow/hung homeserver can't tie up workers indefinitely.
+    let http = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("failed to build HTTP client");
+
     let state = AppState {
         pool,
         config: config.clone(),
-        http: reqwest::Client::new(),
+        http,
     };
-
-    let governor_conf = Arc::new(
-        GovernorConfigBuilder::default()
-            .per_second(60)
-            .burst_size(30)
-            .finish()
-            .unwrap(),
-    );
 
     let cors = if config.cors_allowed_origins.is_empty() {
         tracing::warn!(
@@ -90,13 +88,11 @@ async fn main() {
             .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
     };
 
-    let app = create_router(state)
-        .layer(GovernorLayer::new(governor_conf))
-        .layer(cors);
+    let app = create_router(state).layer(cors);
 
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+    axum::serve(listener, app.into_make_service()).await.unwrap();
 }

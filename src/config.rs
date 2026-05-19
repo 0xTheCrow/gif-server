@@ -20,6 +20,8 @@ pub struct Config {
     /// Maximum total bytes the stored renditions may occupy. Uploads that
     /// would exceed this are rejected with 507.
     pub storage_max_bytes: u64,
+    /// Per-uploader storage ceiling. A user's uploads may not exceed this.
+    pub per_user_storage_bytes: u64,
     /// Allowed CORS origins (exact, e.g. https://durnible.example.com).
     /// Empty means "allow any origin" (with a startup warning).
     pub cors_allowed_origins: Vec<String>,
@@ -47,6 +49,21 @@ impl Config {
         )
         .expect("STORAGE_MAX_BYTES must be a byte count, optionally suffixed with KB/MB/GB/TB");
 
+        let per_user_storage_bytes = parse_size(
+            &std::env::var("PER_USER_STORAGE_BYTES").unwrap_or_else(|_| "1GB".to_string()),
+        )
+        .expect("PER_USER_STORAGE_BYTES must be a byte count, optionally suffixed with KB/MB/GB/TB");
+
+        const MIN_SESSION_SECRET_LEN: usize = 32;
+        let session_secret = std::env::var("SESSION_SECRET")
+            .expect("SESSION_SECRET must be set");
+        if session_secret.len() < MIN_SESSION_SECRET_LEN {
+            panic!(
+                "SESSION_SECRET must be at least {} characters; use a long random value",
+                MIN_SESSION_SECRET_LEN
+            );
+        }
+
         Self {
             database_url: std::env::var("DATABASE_URL")
                 .expect("DATABASE_URL must be set"),
@@ -63,9 +80,9 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             admin_mxids,
-            session_secret: std::env::var("SESSION_SECRET")
-                .expect("SESSION_SECRET must be set"),
+            session_secret,
             storage_max_bytes,
+            per_user_storage_bytes,
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')

@@ -2,6 +2,7 @@ use axum::{extract::{Multipart, State}, http::StatusCode, Extension, Json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::{
     auth::AuthUser,
@@ -75,28 +76,32 @@ pub async fn upload(
     // Hash for deduplication
     let hash = hex::encode(Sha256::digest(&data));
 
-    // Check for duplicate (hash is globally unique). Only return the existing
-    // GIF if the uploader is allowed to see it; otherwise it's another user's
-    // private GIF and we must not disclose it.
-    if let Some(existing) = db::get_gif_by_hash(&state.pool, &hash).await? {
-        if !user.can_view(&existing) {
-            return Err(AppError::Forbidden);
-        }
+    // Per-uploader dedup: a hit is always the requester's own earlier upload,
+    // so there's nothing to authorize and nothing leaked about other users.
+    if let Some(existing) =
+        db::get_gif_by_hash_for_uploader(&state.pool, &hash, &user.mxid).await?
+    {
         let renditions = build_renditions(&state, &existing.id).await?;
         let tags = db::get_tags(&state.pool, &existing.id).await?;
         return Ok((StatusCode::OK, Json(to_response(existing, tags, renditions, &state.config.base_url))));
     }
 
-    // Parse GIF metadata
-    let info = parse_gif_info(&data)?;
+    // Decode + resize is CPU-bound and unbounded by request concurrency, so
+    // run it off the async runtime to avoid stalling other requests.
+    let data = Arc::new(data);
+    let proc = Arc::clone(&data);
+    let (info, preview_data, thumb_data, thumb_w, thumb_h) =
+        tokio::task::spawn_blocking(move || -> Result<_, AppError> {
+            let info = parse_gif_info(&proc)?;
+            let preview = resize_gif(&proc, 220)?;
+            let (thumb, tw, th) = extract_thumbnail(&proc, 220)?;
+            Ok((info, preview, thumb, tw, th))
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("image processing task failed: {e}")))??;
 
     let id = Uuid::new_v4().to_string();
-    let ext = if original_filename.ends_with(".gif") { "gif" } else { "gif" };
-    let original_filename_stored = format!("{}.{}", id, ext);
-
-    // Generate renditions
-    let preview_data  = resize_gif(&data, 220)?;
-    let (thumb_data, thumb_w, thumb_h) = extract_thumbnail(&data, 220)?;
+    let original_filename_stored = format!("{}.gif", id);
 
     let preview_w = if info.width <= 220 { info.width } else { 220 };
     let preview_h = if info.width <= 220 {
@@ -105,35 +110,66 @@ pub async fn upload(
         (info.height as f32 * (220.0 / info.width as f32)) as u32
     };
 
-    // Enforce the storage cap before writing anything to disk.
-    let incoming = (data.len() + preview_data.len() + thumb_data.len()) as i64;
-    let current = db::total_storage_bytes(&state.pool).await?;
-    if (current + incoming) as u64 > state.config.storage_max_bytes {
-        return Err(AppError::InsufficientStorage);
-    }
+    let preview_filename   = format!("{}_preview.gif", id);
+    let thumbnail_filename  = format!("{}_thumb.png", id);
 
-    // Store files
-    files::write_file(&state.config.storage_path, &original_filename_stored, &data).await?;
-    let preview_filename  = format!("{}_preview.gif",  id);
-    let thumbnail_filename = format!("{}_thumb.png", id);
-    files::write_file(&state.config.storage_path, &preview_filename,   &preview_data).await?;
-    files::write_file(&state.config.storage_path, &thumbnail_filename, &thumb_data).await?;
+    let specs = vec![
+        db::RenditionSpec {
+            rendition: "original",
+            filename: original_filename_stored.clone(),
+            width: info.width as i32,
+            height: info.height as i32,
+            size_bytes: data.len() as i32,
+        },
+        db::RenditionSpec {
+            rendition: "preview",
+            filename: preview_filename.clone(),
+            width: preview_w as i32,
+            height: preview_h as i32,
+            size_bytes: preview_data.len() as i32,
+        },
+        db::RenditionSpec {
+            rendition: "thumbnail",
+            filename: thumbnail_filename.clone(),
+            width: thumb_w as i32,
+            height: thumb_h as i32,
+            size_bytes: thumb_data.len() as i32,
+        },
+    ];
 
-    // Persist to DB
-    let gif = db::insert_gif(
-        &state.pool, &id, &original_filename,
-        &hash, &user.mxid, &visibility, is_nsfw, info.frame_count, info.duration_ms,
-    ).await?;
+    // Cap check + insert is atomic (advisory-locked tx). Nothing is written
+    // to disk until the row is committed, so a rejected upload leaves no
+    // orphaned files.
+    let gif = match db::insert_gif_quota(
+        &state.pool, &id, &original_filename, &hash, &user.mxid,
+        &visibility, is_nsfw, info.frame_count, info.duration_ms,
+        &specs, &tags,
+        state.config.storage_max_bytes, state.config.per_user_storage_bytes,
+    ).await? {
+        db::UploadOutcome::QuotaExceeded => return Err(AppError::InsufficientStorage),
+        db::UploadOutcome::Duplicate(existing) => {
+            let renditions = build_renditions(&state, &existing.id).await?;
+            let tags = db::get_tags(&state.pool, &existing.id).await?;
+            return Ok((StatusCode::OK, Json(to_response(existing, tags, renditions, &state.config.base_url))));
+        }
+        db::UploadOutcome::Inserted(gif) => gif,
+    };
 
-    db::insert_rendition(&state.pool, &id, "original",  &original_filename_stored,
-        info.width as i32, info.height as i32, data.len() as i32).await?;
-    db::insert_rendition(&state.pool, &id, "preview",   &preview_filename,
-        preview_w as i32, preview_h as i32, preview_data.len() as i32).await?;
-    db::insert_rendition(&state.pool, &id, "thumbnail", &thumbnail_filename,
-        thumb_w as i32, thumb_h as i32, thumb_data.len() as i32).await?;
-
-    if !tags.is_empty() {
-        db::set_tags(&state.pool, &id, &tags).await?;
+    // Row is committed; write the files. If any write fails, roll the row
+    // back and remove whatever landed so we don't leave a half-stored GIF.
+    let storage = &state.config.storage_path;
+    let write_all = async {
+        files::write_file(storage, &original_filename_stored, data.as_slice()).await?;
+        files::write_file(storage, &preview_filename, &preview_data).await?;
+        files::write_file(storage, &thumbnail_filename, &thumb_data).await?;
+        Ok::<(), AppError>(())
+    };
+    if let Err(e) = write_all.await {
+        let _ = db::delete_gif(&state.pool, &id).await;
+        for f in [&original_filename_stored, &preview_filename, &thumbnail_filename] {
+            let _ = files::delete_file(storage, f).await;
+        }
+        return Err(e);
     }
 
     let renditions = build_renditions(&state, &id).await?;
