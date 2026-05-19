@@ -1,8 +1,8 @@
-use gif_server::{AppState, config::Config, create_router};
+use axum::http::{header, HeaderValue, Method};
+use gif_server::{config::Config, create_router, storage::files, AppState};
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -10,13 +10,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
-
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("add-key") {
-        let name = args.get(2).expect("usage: gif-server add-key <name>");
-        add_api_key(name).await;
-        return;
-    }
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env()
@@ -27,7 +20,7 @@ async fn main() {
     let config = Arc::new(Config::from_env());
 
     if !config.base_url.starts_with("https://") && !config.base_url.starts_with("http://localhost") {
-        tracing::warn!("BASE_URL is not HTTPS — API keys will be transmitted in plaintext");
+        tracing::warn!("BASE_URL is not HTTPS — session tokens will be transmitted in plaintext");
     }
 
     let pool = PgPoolOptions::new()
@@ -36,10 +29,31 @@ async fn main() {
         .await
         .expect("failed to connect to database");
 
+    // Reconcile on-disk bytes against the DB total so orphaned/missing files
+    // surface in logs at startup.
+    match files::dir_size(&config.storage_path) {
+        Ok(on_disk) => {
+            let in_db = gif_server::storage::db::total_storage_bytes(&pool)
+                .await
+                .unwrap_or(0) as u64;
+            if on_disk != in_db {
+                tracing::warn!(
+                    "storage reconciliation: {} bytes on disk vs {} bytes in DB",
+                    on_disk, in_db
+                );
+            }
+            tracing::info!(
+                "storage: {} bytes used of {} byte cap",
+                in_db, config.storage_max_bytes
+            );
+        }
+        Err(e) => tracing::warn!("could not measure storage directory: {}", e),
+    }
+
     let state = AppState {
         pool,
         config: config.clone(),
-        key_cache: Arc::new(RwLock::new(None)),
+        http: reqwest::Client::new(),
     };
 
     let governor_conf = Arc::new(
@@ -50,41 +64,39 @@ async fn main() {
             .unwrap(),
     );
 
+    let cors = if config.cors_allowed_origins.is_empty() {
+        tracing::warn!(
+            "CORS_ALLOWED_ORIGINS is unset — allowing any origin. Set it in production."
+        );
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    } else {
+        let origins: Vec<HeaderValue> = config
+            .cors_allowed_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+            ])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+    };
+
     let app = create_router(state)
         .layer(GovernorLayer::new(governor_conf))
-        .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any));
+        .layer(cors);
 
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
-}
-
-async fn add_api_key(name: &str) {
-    use argon2::{password_hash::{rand_core::OsRng, SaltString}, Argon2, PasswordHasher};
-
-    let config = Config::from_env();
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&config.database_url)
-        .await
-        .expect("failed to connect to database");
-
-    let key = uuid::Uuid::new_v4().to_string().replace("-", "");
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
-        .hash_password(key.as_bytes(), &salt)
-        .expect("hashing failed")
-        .to_string();
-
-    sqlx::query("INSERT INTO api_keys (key_hash, name) VALUES ($1, $2)")
-        .bind(&hash)
-        .bind(name)
-        .execute(&pool)
-        .await
-        .expect("failed to insert key");
-
-    println!("API key for '{}': {}", name, key);
-    println!("Store this — it won't be shown again.");
 }

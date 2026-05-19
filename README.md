@@ -11,7 +11,9 @@ A self-hosted GIF server with tag-based search, modeled after the Tenor API. Wri
 - Featured (sorted by selections) and recent endpoints
 - Cursor-based pagination
 - File deduplication via SHA-256
-- API key authentication
+- Matrix identity auth — users authenticate with a Matrix OpenID token from a trusted homeserver
+- Per-user uploads with shared/private visibility; owner + admin moderation
+- Total storage size cap
 - Per-IP rate limiting (60 req/s, burst 30)
 
 ## Requirements
@@ -41,20 +43,21 @@ docker compose up -d db
 cargo run
 ```
 
-The server starts on `http://localhost:8847`.
+The server starts on `http://localhost:8847`. Set the `MATRIX_*` and
+`SESSION_SECRET` variables in `.env` before running (see Configuration).
 
-**4. Add an API key:**
+**4. Authenticate and test it:**
 
-```bash
-cargo run -- add-key myapp
-```
-
-This prints a key — save it. It is hashed before storage and cannot be retrieved again.
-
-**5. Test it:**
+Obtain a session token by posting a Matrix OpenID token (from
+`mx.getOpenIdToken()` in a Matrix client) to `/auth/matrix`:
 
 ```bash
-curl -H "X-API-Key: <your-key>" http://localhost:8847/gifs/search
+curl -X POST http://localhost:8847/auth/matrix \
+  -H 'Content-Type: application/json' \
+  -d '{"access_token":"<openid-token>","matrix_server_name":"example.com"}'
+# => { "token": "<session-jwt>", "mxid": "@you:example.com", "expires_in": 3600 }
+
+curl -H "Authorization: Bearer <session-jwt>" http://localhost:8847/gifs/search
 ```
 
 ## Docker deployment
@@ -65,11 +68,8 @@ Builds the server into a container alongside Postgres:
 docker compose up --build
 ```
 
-After the first deploy, add an API key inside the container:
-
-```bash
-docker compose exec app gif-server add-key myapp
-```
+Set the `MATRIX_*` and `SESSION_SECRET` environment variables in
+`docker-compose.yml` (or via an env file) before deploying.
 
 Rebuild after code changes:
 
@@ -90,12 +90,46 @@ All configuration is via environment variables (or `.env`):
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8847` | Listen port |
 | `BASE_URL` | `http://localhost:8847` | Public base URL used in rendition URLs |
+| `MATRIX_SERVER_NAME` | — | Trusted homeserver name, e.g. `example.com` (required) |
+| `MATRIX_FEDERATION_URL` | — | Where the homeserver federation API is reachable for OpenID verification, e.g. `https://example.com:8448` (required) |
+| `MATRIX_ADMIN_MXIDS` | _(empty)_ | Comma-separated admin Matrix IDs |
+| `SESSION_SECRET` | — | HMAC secret for signing session tokens (required) |
+| `STORAGE_MAX_BYTES` | `10GB` | Max total rendition bytes; suffix `KB`/`MB`/`GB`/`TB`, `0` disables |
+| `CORS_ALLOWED_ORIGINS` | _(empty)_ | Comma-separated allowed browser origins (e.g. `https://durnible.example.com`). Empty allows any origin with a startup warning — set this in production |
 
 Set `BASE_URL` to your public domain in production (e.g. `https://gifs.example.com`).
 
+Only OpenID tokens issued by `MATRIX_SERVER_NAME`, for users whose mxid lives
+on that server, are accepted — so registration gating on your homeserver
+gates this server automatically. `MATRIX_FEDERATION_URL` must be reachable
+from the gif server; if it's down, nobody can authenticate.
+
+## Authentication
+
+```
+POST /auth/matrix
+Content-Type: application/json
+
+{ "access_token": "<matrix openid token>", "matrix_server_name": "example.com" }
+```
+
+Returns `{ "token": "<jwt>", "mxid": "...", "expires_in": 3600 }`. The token
+is verified against the homeserver's federation OpenID userinfo endpoint. Send
+the returned JWT as `Authorization: Bearer <jwt>` on every other endpoint;
+re-exchange a fresh OpenID token when it expires.
+
 ## API
 
-All endpoints require an `X-API-Key` header.
+All endpoints except `POST /auth/matrix` and `GET /health` require an
+`Authorization: Bearer <session-jwt>` header. `GET /health` is an
+unauthenticated probe returning `200` if the database is reachable, else `503`.
+
+A GIF is **shared** (visible to everyone) or **private** (visible only to its
+uploader), and may be flagged **NSFW** (`is_nsfw`). NSFW GIFs are excluded
+from all listings unless `grab_nsfw=true`, but are still returned by a direct
+`GET /gifs/:id`. The uploader, or an admin acting on a shared GIF, can change
+visibility, the NSFW flag, tags, or delete it. Admins never see or touch other
+users' private GIFs.
 
 ### Upload
 
@@ -104,20 +138,30 @@ POST /gifs
 Content-Type: multipart/form-data
 
 Fields:
-  file   — GIF file (required)
-  tags   — comma-separated tags (optional, max 20, each max 100 chars)
+  file       — GIF file (required)
+  tags       — comma-separated tags (optional, max 20, each max 100 chars)
+  visibility — "shared" (default) or "private"
+  nsfw       — "true"/"1"/"yes" to flag NSFW (optional, default false)
 ```
 
-Returns `201 Created` with GIF metadata. Returns `200 OK` if the file was already uploaded (deduplicated by content hash).
+Returns `201 Created` with GIF metadata. Returns `200 OK` if the file was
+already uploaded (deduplicated by content hash). Returns `507 Insufficient
+Storage` if the upload would exceed `STORAGE_MAX_BYTES`.
 
 ### Fetch
 
 ```
 GET  /gifs/:id                        — metadata + rendition URLs
 GET  /gifs/:id/file                   — serve file (?rendition=original|preview|thumbnail)
-POST /gifs/:id/select                 — record a user selection (increments ranking)
-DELETE /gifs/:id                      — delete GIF and all rendition files
+POST /gifs/:id/select                 — record a selection: bumps the shared featured ranking and adds the GIF to your personal history
+PUT    /gifs/:id/favorite             — add to your favorites (idempotent)
+DELETE /gifs/:id/favorite             — remove from your favorites
+PATCH  /gifs/:id  {"visibility"?,"is_nsfw"?}  — update metadata; >=1 field required (uploader, or admin on shared)
+DELETE /gifs/:id                      — delete GIF and all rendition files (uploader, or admin on shared)
 ```
+
+GIFs you can't see (another user's private GIF) return `404`. Visible but
+not yours returns `403` on mutating actions.
 
 ### Search
 
@@ -125,10 +169,22 @@ DELETE /gifs/:id                      — delete GIF and all rendition files
 GET /gifs/search?q=cat+funny&limit=20&pos=<cursor>   — search by tags / filename
 GET /gifs/featured?limit=20&pos=<cursor>             — sorted by selection count
 GET /gifs/recent?limit=20&pos=<cursor>               — sorted by upload date
+GET /gifs/favorites?limit=20&pos=<cursor>            — your favorited GIFs, newest-first
+GET /gifs/history?limit=20&pos=<cursor>              — GIFs you've selected, most-recently-used first
 GET /gifs/tags/suggest?q=ca&limit=10                 — tag autocomplete
 ```
 
-`limit` defaults to 20, max 50. `pos` is a pagination cursor returned in the `next` field of list responses.
+`limit` defaults to 20, max 50. `pos` is a pagination cursor returned in the
+`next` field of list responses. Add `&mine=true` to search/featured/recent to
+restrict results to your own uploads. Add `&grab_nsfw=true` to include GIFs
+flagged NSFW; by default they are excluded from all listings (unconditionally —
+even from your own `&mine=true`, favorites, and history results). List/search
+results always exclude other users' private GIFs.
+
+`tags/suggest` only suggests tags that appear on a shared, non-NSFW GIF — tags
+existing solely on private GIFs (anyone's, including yours) or NSFW GIFs are
+never returned (pass `&grab_nsfw=true` to include NSFW-only tags). It is a
+prefix autocomplete, not fuzzy matching.
 
 ### Tags
 
@@ -145,6 +201,9 @@ DELETE /gifs/:id/tags   {"tags": ["a"]}        — remove specific tags
 {
   "id": "79789093-766a-4a3e-a8c8-aff34fcb5e1f",
   "filename": "animation.gif",
+  "uploader_id": "@you:example.com",
+  "visibility": "shared",
+  "is_nsfw": false,
   "tags": ["nature", "birds"],
   "frame_count": 42,
   "duration_ms": 4200,

@@ -9,7 +9,8 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "sync"] }
-argon2 = "0.5"
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 image = { version = "0.25", default-features = false, features = ["gif", "png"] }
 gif = "0.14"
 uuid = { version = "1", features = ["v4"] }

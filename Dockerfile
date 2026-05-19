@@ -19,7 +19,7 @@ RUN cargo build --release --bin gif-server
 # Stage 4: minimal runtime image
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libssl3 ca-certificates \
+    && apt-get install -y --no-install-recommends libssl3 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 RUN mkdir -p storage

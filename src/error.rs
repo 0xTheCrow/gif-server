@@ -9,6 +9,10 @@ pub enum AppError {
     NotFound,
     #[error("unauthorized")]
     Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
+    #[error("insufficient storage")]
+    InsufficientStorage,
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("conflict: {0}")]
@@ -28,6 +32,10 @@ impl IntoResponse for AppError {
                 (StatusCode::NOT_FOUND, "not_found", "not found".to_string()),
             AppError::Unauthorized =>
                 (StatusCode::UNAUTHORIZED, "unauthorized", "unauthorized".to_string()),
+            AppError::Forbidden =>
+                (StatusCode::FORBIDDEN, "forbidden", "forbidden".to_string()),
+            AppError::InsufficientStorage =>
+                (StatusCode::INSUFFICIENT_STORAGE, "insufficient_storage", "storage limit reached".to_string()),
             AppError::BadRequest(msg) =>
                 (StatusCode::BAD_REQUEST, "bad_request", format!("bad request: {}", msg)),
             AppError::Conflict(msg) =>

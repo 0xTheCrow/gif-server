@@ -1,9 +1,10 @@
-use axum::{extract::{Multipart, State}, http::StatusCode, Json};
+use axum::{extract::{Multipart, State}, http::StatusCode, Extension, Json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use std::collections::HashMap;
 
 use crate::{
+    auth::AuthUser,
     error::AppError,
     models::{GifResponse, RenditionInfo},
     storage::{
@@ -15,10 +16,13 @@ use crate::{
 
 pub async fn upload(
     State(state): State<AppState>,
+    Extension(user): Extension<AuthUser>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<GifResponse>), AppError> {
     let mut gif_data: Option<(String, Vec<u8>)> = None;
     let mut tags: Vec<String> = Vec::new();
+    let mut visibility = String::from("shared");
+    let mut is_nsfw = false;
 
     while let Some(field) = multipart.next_field().await
         .map_err(|e| AppError::BadRequest(e.to_string()))? {
@@ -42,8 +46,27 @@ pub async fn upload(
                     .map(|t| t.chars().take(100).collect::<String>())
                     .collect();
             }
+            Some("visibility") => {
+                visibility = field.text().await
+                    .map_err(|e| AppError::BadRequest(e.to_string()))?
+                    .trim()
+                    .to_lowercase();
+            }
+            Some("nsfw") => {
+                let v = field.text().await
+                    .map_err(|e| AppError::BadRequest(e.to_string()))?
+                    .trim()
+                    .to_lowercase();
+                is_nsfw = matches!(v.as_str(), "true" | "1" | "yes");
+            }
             _ => {}
         }
+    }
+
+    if visibility != "shared" && visibility != "private" {
+        return Err(AppError::BadRequest(
+            "visibility must be 'shared' or 'private'".into(),
+        ));
     }
 
     let (original_filename, data) = gif_data
@@ -52,8 +75,13 @@ pub async fn upload(
     // Hash for deduplication
     let hash = hex::encode(Sha256::digest(&data));
 
-    // Check for duplicate
+    // Check for duplicate (hash is globally unique). Only return the existing
+    // GIF if the uploader is allowed to see it; otherwise it's another user's
+    // private GIF and we must not disclose it.
     if let Some(existing) = db::get_gif_by_hash(&state.pool, &hash).await? {
+        if !user.can_view(&existing) {
+            return Err(AppError::Forbidden);
+        }
         let renditions = build_renditions(&state, &existing.id).await?;
         let tags = db::get_tags(&state.pool, &existing.id).await?;
         return Ok((StatusCode::OK, Json(to_response(existing, tags, renditions, &state.config.base_url))));
@@ -77,6 +105,13 @@ pub async fn upload(
         (info.height as f32 * (220.0 / info.width as f32)) as u32
     };
 
+    // Enforce the storage cap before writing anything to disk.
+    let incoming = (data.len() + preview_data.len() + thumb_data.len()) as i64;
+    let current = db::total_storage_bytes(&state.pool).await?;
+    if (current + incoming) as u64 > state.config.storage_max_bytes {
+        return Err(AppError::InsufficientStorage);
+    }
+
     // Store files
     files::write_file(&state.config.storage_path, &original_filename_stored, &data).await?;
     let preview_filename  = format!("{}_preview.gif",  id);
@@ -87,7 +122,7 @@ pub async fn upload(
     // Persist to DB
     let gif = db::insert_gif(
         &state.pool, &id, &original_filename,
-        &hash, info.frame_count, info.duration_ms,
+        &hash, &user.mxid, &visibility, is_nsfw, info.frame_count, info.duration_ms,
     ).await?;
 
     db::insert_rendition(&state.pool, &id, "original",  &original_filename_stored,
@@ -129,6 +164,9 @@ pub fn to_response(gif: crate::models::Gif, tags: Vec<String>, renditions: HashM
     GifResponse {
         id:          gif.id,
         filename:    gif.filename,
+        uploader_id: gif.uploader_id,
+        visibility:  gif.visibility,
+        is_nsfw:     gif.is_nsfw,
         tags,
         frame_count: gif.frame_count,
         duration_ms: gif.duration_ms,

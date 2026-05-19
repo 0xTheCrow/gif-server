@@ -26,8 +26,20 @@ services:
       HOST: 0.0.0.0
       PORT: 8847
       BASE_URL: http://localhost:8847
+      MATRIX_SERVER_NAME: example.com
+      MATRIX_FEDERATION_URL: https://example.com:8448
+      MATRIX_ADMIN_MXIDS: "@you:example.com"
+      SESSION_SECRET: change-me-to-a-long-random-string
+      STORAGE_MAX_BYTES: 10GB
+      CORS_ALLOWED_ORIGINS: ""
     volumes:
       - ./storage:/app/storage
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8847/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       db:
         condition: service_healthy

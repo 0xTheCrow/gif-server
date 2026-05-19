@@ -5,80 +5,41 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use serde_json::json;
-use std::time::{Duration, Instant};
 
-use crate::{AppState, KeyCache};
+use crate::{auth::verify_session, AppState};
 
-const CACHE_TTL: Duration = Duration::from_secs(30);
-
-pub async fn require_api_key(
+/// Require a valid session token (minted by `POST /auth/matrix`) on the
+/// `Authorization: Bearer` header, and inject the `AuthUser` into request
+/// extensions for handlers to read.
+pub async fn require_session(
     State(state): State<AppState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    let key = req
+    let token = req
         .headers()
-        .get("X-API-Key")
+        .get("Authorization")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_string);
 
-    let Some(key) = key else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "unauthorized", "message": "missing X-API-Key header" })),
-        ).into_response();
+    let Some(token) = token else {
+        return unauthorized("missing Authorization: Bearer token");
     };
 
-    let hashes = get_hashes(&state).await;
-    let hashes = match hashes {
-        Ok(h) => h,
-        Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal_error", "message": "an internal error occurred" })),
-            ).into_response();
-        }
+    let Some(user) = verify_session(&state.config, &token) else {
+        return unauthorized("invalid or expired session token");
     };
 
-    let argon2 = Argon2::default();
-    let valid = hashes.iter().any(|hash| {
-        PasswordHash::new(hash)
-            .map(|parsed| argon2.verify_password(key.as_bytes(), &parsed).is_ok())
-            .unwrap_or(false)
-    });
-
-    if !valid {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "unauthorized", "message": "invalid API key" })),
-        ).into_response();
-    }
-
+    req.extensions_mut().insert(user);
     next.run(req).await
 }
 
-async fn get_hashes(state: &AppState) -> Result<Vec<String>, sqlx::Error> {
-    // Try cache first
-    {
-        let cache = state.key_cache.read().await;
-        if let Some(ref c) = *cache {
-            if c.loaded_at.elapsed() < CACHE_TTL {
-                return Ok(c.hashes.clone());
-            }
-        }
-    }
-
-    // Cache miss or expired — fetch from DB
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT key_hash FROM api_keys")
-        .fetch_all(&state.pool)
-        .await?;
-
-    let hashes: Vec<String> = rows.into_iter().map(|(h,)| h).collect();
-
-    let mut cache = state.key_cache.write().await;
-    *cache = Some(KeyCache { hashes: hashes.clone(), loaded_at: Instant::now() });
-
-    Ok(hashes)
+fn unauthorized(message: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "unauthorized", "message": message })),
+    )
+        .into_response()
 }

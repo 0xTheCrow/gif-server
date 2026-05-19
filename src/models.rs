@@ -6,6 +6,9 @@ pub struct Gif {
     pub id:          String,
     pub filename:    String,
     pub hash:        String,
+    pub uploader_id: String,
+    pub visibility:  String,
+    pub is_nsfw:     bool,
     pub frame_count: i32,
     pub duration_ms: i32,
     pub uses:        i64,
@@ -35,6 +38,9 @@ pub struct RenditionInfo {
 pub struct GifResponse {
     pub id:          String,
     pub filename:    String,
+    pub uploader_id: String,
+    pub visibility:  String,
+    pub is_nsfw:     bool,
     pub tags:        Vec<String>,
     pub frame_count: i32,
     pub duration_ms: i32,
@@ -55,23 +61,44 @@ pub struct SearchParams {
     pub q:     Option<String>,
     pub limit: Option<i64>,
     pub pos:   Option<String>,
+    #[serde(default)]
+    pub mine:  bool,
+    /// When false (default) GIFs flagged NSFW are excluded.
+    #[serde(default)]
+    pub grab_nsfw: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PaginationParams {
     pub limit: Option<i64>,
     pub pos:   Option<String>,
+    #[serde(default)]
+    pub mine:  bool,
+    /// When false (default) GIFs flagged NSFW are excluded.
+    #[serde(default)]
+    pub grab_nsfw: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SuggestParams {
     pub q:     String,
     pub limit: Option<i64>,
+    /// When false (default) tags only on NSFW GIFs are excluded.
+    #[serde(default)]
+    pub grab_nsfw: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct TagsBody {
     pub tags: Vec<String>,
+}
+
+/// Body for `PATCH /gifs/:id`. Each field is optional; only the provided
+/// ones are updated.
+#[derive(Debug, Deserialize)]
+pub struct GifPatch {
+    pub visibility: Option<String>,
+    pub is_nsfw:    Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
