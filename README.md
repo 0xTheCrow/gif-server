@@ -126,7 +126,10 @@ All endpoints except `POST /auth/matrix` and `GET /health` require an
 `Authorization: Bearer <session-jwt>` header. `GET /health` is an
 unauthenticated probe returning `200` if the database is reachable, else `503`.
 
-Authenticated endpoints are rate-limited per Matrix user (≈30 req/s, burst 60);
+Authenticated endpoints are rate-limited per Matrix user: ≈30 req/s (burst 60)
+for API/mutation calls, ≈50 req/s (burst 200) for `GET /gifs/tags/suggest`
+(autocomplete fires per keystroke), and a much looser ≈200 req/s (burst 1000)
+for `GET /gifs/:id/file`, since one grid page fans out to many image fetches.
 `POST /auth/matrix` has a strict global limit (burst 10). Exceeding a limit
 returns `429 Too Many Requests`.
 

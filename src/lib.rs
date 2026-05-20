@@ -61,6 +61,28 @@ pub fn create_router(state: AppState) -> Router {
             .finish()
             .expect("invalid per-user rate-limit config"),
     );
+    // Looser limit for file serving: one grid page can fan out to dozens of
+    // `<img src>` fetches per user-initiated action, so we don't want browse
+    // patterns competing for the same bucket as API/mutation calls.
+    let file_rate_limit = Arc::new(
+        GovernorConfigBuilder::default()
+            .key_extractor(MxidKeyExtractor)
+            .per_second(200)
+            .burst_size(1000)
+            .finish()
+            .expect("invalid file rate-limit config"),
+    );
+    // Autocomplete fires per keystroke; even with UI debounce, a few quick
+    // queries plus the resulting grid load shouldn't compete for the same
+    // tokens as mutations.
+    let suggest_rate_limit = Arc::new(
+        GovernorConfigBuilder::default()
+            .key_extractor(MxidKeyExtractor)
+            .per_second(50)
+            .burst_size(200)
+            .finish()
+            .expect("invalid suggest rate-limit config"),
+    );
     let auth_rate_limit = Arc::new(
         GovernorConfigBuilder::default()
             .key_extractor(GlobalKeyExtractor)
@@ -70,12 +92,27 @@ pub fn create_router(state: AppState) -> Router {
             .expect("invalid auth rate-limit config"),
     );
 
+    let files = Router::new()
+        .route("/gifs/{id}/file", get(routes::fetch::serve_file))
+        .layer(GovernorLayer::new(file_rate_limit))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth::require_session,
+        ));
+
+    let suggest = Router::new()
+        .route("/gifs/tags/suggest", get(routes::search::suggest))
+        .layer(GovernorLayer::new(suggest_rate_limit))
+        .layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth::require_session,
+        ));
+
     let protected = Router::new()
         .route("/gifs",                post(routes::upload::upload))
         .route("/gifs/{id}",           get(routes::fetch::get_gif)
                                        .patch(routes::fetch::patch_gif)
                                        .delete(routes::fetch::delete_gif))
-        .route("/gifs/{id}/file",      get(routes::fetch::serve_file))
         .route("/gifs/{id}/select",    post(routes::fetch::select_gif))
         .route("/gifs/{id}/favorite",  put(routes::favorites::add_favorite)
                                        .delete(routes::favorites::remove_favorite))
@@ -90,7 +127,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/gifs/favorites",      get(routes::favorites::list_favorites))
         .route("/gifs/hidden",         get(routes::favorites::list_hidden))
         .route("/gifs/history",        get(routes::favorites::list_history))
-        .route("/gifs/tags/suggest",   get(routes::search::suggest))
         // Governor is added before the session layer so it ends up *inside*
         // it: the session middleware runs first and populates `AuthUser`,
         // then the per-user limiter reads it.
@@ -108,6 +144,8 @@ pub fn create_router(state: AppState) -> Router {
         );
 
     protected
+        .merge(files)
+        .merge(suggest)
         .merge(public)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
