@@ -16,7 +16,7 @@ use axum::{
 use std::sync::Arc;
 use tower_governor::{
     governor::GovernorConfigBuilder,
-    key_extractor::{GlobalKeyExtractor, KeyExtractor},
+    key_extractor::{GlobalKeyExtractor, KeyExtractor, SmartIpKeyExtractor},
     GovernorError, GovernorLayer,
 };
 use tower_http::trace::TraceLayer;
@@ -83,13 +83,32 @@ pub fn create_router(state: AppState) -> Router {
             .finish()
             .expect("invalid suggest rate-limit config"),
     );
-    let auth_rate_limit = Arc::new(
+    // /auth/matrix is unauthenticated and triggers an outbound homeserver
+    // call, so we layer two limits:
+    //   * a global cap to bound total backend load
+    //   * a per-IP cap so one attacker can't drain the global bucket and
+    //     deny login to everyone else
+    // Per-IP rate (1/s) is strictly less than global rate (5/s), so a single
+    // attacker leaves headroom for legitimate users.
+    // SmartIpKeyExtractor reads X-Forwarded-For / X-Real-IP / Forwarded;
+    // **only safe when the app is reached exclusively through a trusted
+    // reverse proxy that strips/sets these headers** — direct exposure would
+    // let a client spoof their key and bypass the per-IP limit.
+    let auth_global_rate_limit = Arc::new(
         GovernorConfigBuilder::default()
             .key_extractor(GlobalKeyExtractor)
-            .per_second(1)
-            .burst_size(10)
+            .per_second(5)
+            .burst_size(20)
             .finish()
-            .expect("invalid auth rate-limit config"),
+            .expect("invalid auth global rate-limit config"),
+    );
+    let auth_per_ip_rate_limit = Arc::new(
+        GovernorConfigBuilder::default()
+            .key_extractor(SmartIpKeyExtractor)
+            .per_second(1)
+            .burst_size(5)
+            .finish()
+            .expect("invalid auth per-IP rate-limit config"),
     );
 
     let files = Router::new()
@@ -136,16 +155,17 @@ pub fn create_router(state: AppState) -> Router {
             middleware::auth::require_session,
         ));
 
-    let public = Router::new()
-        .route("/health", get(routes::health::health))
-        .route(
-            "/auth/matrix",
-            post(routes::auth::matrix_login).layer(GovernorLayer::new(auth_rate_limit)),
-        );
+    let auth = Router::new()
+        .route("/auth/matrix", post(routes::auth::matrix_login))
+        .layer(GovernorLayer::new(auth_per_ip_rate_limit))
+        .layer(GovernorLayer::new(auth_global_rate_limit));
+
+    let public = Router::new().route("/health", get(routes::health::health));
 
     protected
         .merge(files)
         .merge(suggest)
+        .merge(auth)
         .merge(public)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())

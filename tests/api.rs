@@ -1459,6 +1459,7 @@ async fn auth_matrix_rejects_token_from_untrusted_homeserver(pool: PgPool) {
         .oneshot(
             Request::post("/auth/matrix")
                 .header("Content-Type", "application/json")
+                .header("X-Forwarded-For", "1.2.3.4")
                 .body(Body::from(
                     r#"{"access_token":"x","matrix_server_name":"evil.example"}"#,
                 ))
@@ -1483,6 +1484,7 @@ async fn auth_matrix_attempts_federation_verification_for_trusted_homeserver(poo
         .oneshot(
             Request::post("/auth/matrix")
                 .header("Content-Type", "application/json")
+                .header("X-Forwarded-For", "1.2.3.4")
                 .body(Body::from(
                     r#"{"access_token":"x","matrix_server_name":"test.server"}"#,
                 ))
@@ -2281,31 +2283,53 @@ async fn identical_file_from_different_users_is_not_deduped(pool: PgPool) {
 
 #[sqlx::test]
 async fn auth_matrix_is_rate_limited(pool: PgPool) {
-    // Global limiter on /auth/matrix: burst 10, so a rapid 11th request is
-    // rejected with 429 before reaching verification.
+    // /auth/matrix has two layered limiters:
+    //   * per-IP (burst 5) — one IP gets throttled quickly
+    //   * global  (burst 20) — caps total backend load
+    // We verify both: a single IP hits 429 within its per-IP burst, and
+    // rotating IPs eventually hit the global cap.
     let (state, _dir) = make_state(pool);
     let app = create_router(state);
 
-    let mut saw_429 = false;
-    for _ in 0..15 {
-        let res = app
-            .clone()
-            .oneshot(
+    let send = |ip: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
                 Request::post("/auth/matrix")
                     .header("Content-Type", "application/json")
+                    .header("X-Forwarded-For", ip)
                     .body(Body::from(
                         r#"{"access_token":"x","matrix_server_name":"test.server"}"#,
                     ))
                     .unwrap(),
             )
             .await
-            .unwrap();
-        if res.status() == StatusCode::TOO_MANY_REQUESTS {
-            saw_429 = true;
+            .unwrap()
+        }
+    };
+
+    // Per-IP limit: single IP hammered should 429 within ~burst_size requests.
+    let mut saw_per_ip_429 = false;
+    for _ in 0..15 {
+        if send("1.2.3.4").await.status() == StatusCode::TOO_MANY_REQUESTS {
+            saw_per_ip_429 = true;
             break;
         }
     }
-    assert!(saw_429, "expected a 429 within the burst window");
+    assert!(saw_per_ip_429, "expected per-IP 429 within burst window");
+
+    // Global limit: rotating IPs each have their own per-IP bucket, but
+    // the shared global bucket (burst 20) should still kick in.
+    let mut saw_global_429 = false;
+    for i in 0..40u8 {
+        // synthesize a unique IP per request to dodge the per-IP limiter
+        let ip: &'static str = Box::leak(format!("10.0.0.{}", i).into_boxed_str());
+        if send(ip).await.status() == StatusCode::TOO_MANY_REQUESTS {
+            saw_global_429 = true;
+            break;
+        }
+    }
+    assert!(saw_global_429, "expected global 429 once burst exhausted across many IPs");
 }
 
 #[sqlx::test]

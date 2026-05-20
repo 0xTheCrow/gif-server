@@ -130,8 +130,12 @@ Authenticated endpoints are rate-limited per Matrix user: ≈30 req/s (burst 60)
 for API/mutation calls, ≈50 req/s (burst 200) for `GET /gifs/tags/suggest`
 (autocomplete fires per keystroke), and a much looser ≈200 req/s (burst 1000)
 for `GET /gifs/:id/file`, since one grid page fans out to many image fetches.
-`POST /auth/matrix` has a strict global limit (burst 10). Exceeding a limit
-returns `429 Too Many Requests`.
+`POST /auth/matrix` has two layered limits: a global cap (≈5 req/s, burst 20)
+bounds total backend load, and a per-IP cap (≈1 req/s, burst 5) prevents any
+single attacker from draining the global bucket and denying login to others.
+The per-IP key uses `X-Forwarded-For` / `X-Real-IP` / `Forwarded`, so the
+server must be reached only through a trusted reverse proxy that sets these
+headers. Exceeding any limit returns `429 Too Many Requests`.
 
 A GIF is **shared** (visible to everyone) or **private** (visible only to its
 uploader), and may be flagged **NSFW** (`is_nsfw`). NSFW GIFs are excluded
