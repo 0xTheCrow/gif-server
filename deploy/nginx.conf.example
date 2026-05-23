@@ -1,0 +1,53 @@
+# Example nginx server block for gif-server, for a CONTAINERIZED nginx
+# (e.g. lscr.io/linuxserver/nginx) sharing the `nginx` Docker network with the
+# gif-server app. Copy into your site-confs dir, e.g.:
+#   /docker/apps/nginx/nginx/site-confs/gif-server.conf
+# adjust server_name + cert paths, then reload nginx:
+#   docker exec <nginx-container> nginx -s reload
+#
+# The app joins the `nginx` network with alias `gif-server` (see
+# docker-compose.yml), so nginx reaches it as http://gif-server:8847. The app
+# is never published to the public internet; nginx is the only ingress.
+
+server {
+    listen 80;
+    server_name gifs.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name gifs.example.com;
+
+    # TLS — point these at the certs you mount into the nginx container.
+    # Paths are INSIDE the container, not on the host.
+    ssl_certificate     /config/keys/gifs.example.com/fullchain.pem;
+    ssl_certificate_key /config/keys/gifs.example.com/privkey.pem;
+
+    # Matches the app's 50 MB upload limit (src/lib.rs DefaultBodyLimit).
+    # nginx defaults to 1 MB and would otherwise 413 every GIF upload.
+    client_max_body_size 50m;
+
+    # Docker's embedded DNS. Using a variable upstream (below) forces nginx to
+    # re-resolve the app container's IP at request time, so an app restart
+    # (which can change the container IP) doesn't strand nginx on a stale
+    # address and start returning 502s.
+    resolver 127.0.0.11 valid=30s;
+
+    location / {
+        set $upstream http://gif-server:8847;
+        proxy_pass $upstream$request_uri;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # SECURITY: overwrite these, do NOT append. The rate limiter's
+        # SmartIpKeyExtractor takes the LEFTMOST X-Forwarded-For value, so the
+        # usual `$proxy_add_x_forwarded_for` (which appends to a client-supplied
+        # header) would let a client prepend a spoofed IP and dodge the per-IP
+        # auth limiter. Setting them to the real peer address closes that hole.
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
+    }
+}

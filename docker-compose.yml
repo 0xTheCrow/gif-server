@@ -1,12 +1,15 @@
 services:
   db:
     image: postgres:16
+    restart: unless-stopped
     environment:
       POSTGRES_DB: gifserver
       POSTGRES_USER: gifserver
-      POSTGRES_PASSWORD: gifserver
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gifserver}
+    # Bound to localhost only: reachable by `cargo run` on the host for dev,
+    # and by the app container over the internal network, but not the LAN.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -17,21 +20,27 @@ services:
 
   app:
     build: .
+    restart: unless-stopped
+    # Bound to localhost only: the host's nginx reverse proxy reaches it here;
+    # the public internet never hits the app directly (required for the
+    # X-Forwarded-For-based rate limiter to be trustworthy).
     ports:
-      - "8847:8847"
+      - "127.0.0.1:8847:8847"
     environment:
-      DATABASE_URL: postgres://gifserver:gifserver@db:5432/gifserver
+      # DATABASE_URL is built from POSTGRES_PASSWORD so the password lives in
+      # exactly one place and the host is always the `db` service.
+      DATABASE_URL: postgres://gifserver:${POSTGRES_PASSWORD:-gifserver}@db:5432/gifserver
       STORAGE_PATH: /app/storage
       HOST: 0.0.0.0
       PORT: 8847
-      BASE_URL: http://localhost:8847
-      MATRIX_SERVER_NAME: example.com
-      MATRIX_FEDERATION_URL: https://example.com:8448
-      MATRIX_ADMIN_MXIDS: "@you:example.com"
-      SESSION_SECRET: change-me-to-a-long-random-string
-      STORAGE_MAX_BYTES: 10GB
-      PER_USER_STORAGE_BYTES: 1GB
-      CORS_ALLOWED_ORIGINS: ""
+      BASE_URL: ${BASE_URL:?set BASE_URL in .env}
+      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:?set MATRIX_SERVER_NAME in .env}
+      MATRIX_FEDERATION_URL: ${MATRIX_FEDERATION_URL:?set MATRIX_FEDERATION_URL in .env}
+      MATRIX_ADMIN_MXIDS: ${MATRIX_ADMIN_MXIDS:-}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      STORAGE_MAX_BYTES: ${STORAGE_MAX_BYTES:-10GB}
+      PER_USER_STORAGE_BYTES: ${PER_USER_STORAGE_BYTES:-1GB}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     volumes:
       - ./storage:/app/storage
     healthcheck:
@@ -43,6 +52,20 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    networks:
+      # Internal network for app <-> db traffic.
+      default: {}
+      # Join the pre-existing nginx network so the nginx container can reach
+      # this app as http://gif-server:8847 (no host port needed for that path).
+      nginx:
+        aliases:
+          - gif-server
 
 volumes:
   postgres_data:
+
+networks:
+  default:
+  # The nginx stack's network, created outside this compose project.
+  nginx:
+    external: true
