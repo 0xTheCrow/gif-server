@@ -8,8 +8,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gifserver}
     # Bound to localhost only: reachable by `cargo run` on the host for dev,
     # and by the app container over the internal network, but not the LAN.
+    # Host port is configurable to avoid clashing with other Postgres
+    # instances on the same machine; the app never uses it (it connects to
+    # `db:5432` over the internal network).
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${DB_HOST_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -23,9 +26,11 @@ services:
     restart: unless-stopped
     # Bound to localhost only: the host's nginx reverse proxy reaches it here;
     # the public internet never hits the app directly (required for the
-    # X-Forwarded-For-based rate limiter to be trustworthy).
+    # X-Forwarded-For-based rate limiter to be trustworthy). Host port is
+    # configurable to avoid clashing with other host services; nginx reaches
+    # the app via gif-server:8847 on the internal network regardless.
     ports:
-      - "127.0.0.1:8847:8847"
+      - "127.0.0.1:${APP_HOST_PORT:-8847}:8847"
     environment:
       # DATABASE_URL is built from POSTGRES_PASSWORD so the password lives in
       # exactly one place and the host is always the `db` service.
@@ -42,7 +47,7 @@ services:
       PER_USER_STORAGE_BYTES: ${PER_USER_STORAGE_BYTES:-1GB}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     volumes:
-      - ./storage:/app/storage
+      - ./data:/app/storage
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8847/health"]
       interval: 10s

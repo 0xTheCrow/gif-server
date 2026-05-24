@@ -1,0 +1,293 @@
+% gif-server deployment guide.
+% Source for deploy/deployment-guide.pdf. Rebuild with:
+%   pdflatex -output-directory deploy deploy/deployment-guide.tex
+% (run twice if section references ever get added).
+\documentclass[11pt]{article}
+
+% T1 + lmodern so literal $ < > _ { } | print correctly in \texttt (OT1 mangles
+% them, e.g. $ -> pound sign).
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{parskip}
+\usepackage{framed}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+
+\definecolor{codebg}{rgb}{0.96,0.96,0.96}
+\definecolor{codeframe}{rgb}{0.85,0.85,0.85}
+\definecolor{warnbg}{rgb}{1.0,0.97,0.88}
+
+% Block code style.
+\lstdefinestyle{block}{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  breakatwhitespace=false,
+  frame=single,
+  rulecolor=\color{codeframe},
+  framesep=6pt,
+  xleftmargin=4pt,
+  xrightmargin=4pt,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  literate={~}{{\textasciitilde}}1
+}
+\lstset{style=block}
+
+% Long monospace tokens (error strings, commands) can't hyphenate; let TeX
+% stretch interword space rather than overrun the margin.
+\sloppy
+
+% Inline code shorthand. Uses \detokenize (not \lstinline) so it is safe inside
+% macro arguments such as \colorbox{} and \item[...]; underscores, $ and # print
+% literally without entering math mode.
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+% Simple "note" box: colored, breakable, accepts arbitrary content.
+\colorlet{shadecolor}{warnbg}
+\newenvironment{note}{\begin{shaded}\itshape\noindent\ignorespaces}{\end{shaded}}
+
+\title{\textbf{gif-server --- Deployment Guide}}
+\date{}
+
+\begin{document}
+
+{\Huge\bfseries gif-server --- Deployment Guide}\par
+\medskip
+{\small Self-hosted deployment to a Docker homeserver behind a containerized nginx
+reverse proxy. Generated 2026-05-24.}
+
+\hrule
+\bigskip
+
+\section*{1.\quad Architecture}
+Three pieces, all on the homeserver:
+\begin{itemize}[nosep]
+  \item \textbf{db} --- Postgres 16 container (gif-server's compose stack).
+  \item \textbf{app} --- the gif-server binary container. Migrations run automatically on
+        startup. Bound to \code{127.0.0.1:<APP_HOST_PORT>} on the host (for debugging) and
+        joined to the existing nginx Docker network with alias \code{gif-server}.
+  \item \textbf{nginx} --- a pre-existing container (\code{lscr.io/linuxserver/nginx}) on the
+        nginx network. The sole public ingress; terminates TLS and proxies to
+        \code{http://gif-server:8847}.
+\end{itemize}
+The app is never published to the internet. The internet reaches it only through nginx.
+
+\section*{2.\quad Prerequisites}
+\begin{itemize}[nosep]
+  \item Docker + Docker Compose on the homeserver (already present).
+  \item The existing nginx container \emph{and the Docker network it is attached to}. Note the
+        network's real name (see the box below) --- it is often \emph{not} literally \code{nginx}.
+  \item DNS A/AAAA record for the public domain (e.g.\ \code{gifs.example.com}) pointing at the
+        homeserver's public IP.
+  \item Router port-forward of TCP \textbf{80} and \textbf{443} to the homeserver.
+  \item A TLS certificate for the domain, mounted into the nginx container (handled separately).
+  \item A few GB of free RAM/disk --- the first Rust build is slow and memory-hungry.
+\end{itemize}
+
+\begin{note}
+\textbf{The nginx network name.} \code{docker-compose.yml} joins an \code{external} network. Compose
+does a \emph{literal} lookup, so the network must exist by the exact name given. Having an nginx
+\emph{container} is not the same as having a network \emph{named} \code{nginx}: a container started by
+its own compose project is usually on a project-prefixed network like \code{nginx_default}. Find the
+real name with \code{docker network ls} (or \code{docker inspect <nginx-container>}), then set it in the
+\code{name:} field of the network block --- see Section 7.
+\end{note}
+
+\section*{3.\quad Repository files involved}
+\begin{description}[style=nextline,nosep,leftmargin=0pt]
+  \item[\code{docker-compose.yml}] db + app stack. Config comes from \code{.env} via
+        \code{${VAR}} interpolation. App joins the external nginx network.
+  \item[\code{.env.example}] Template for configuration. The real \code{.env} is created on the
+        server and is git-ignored / not rsynced.
+  \item[\code{deploy/nginx.conf.example}] Reverse-proxy server block to copy into the nginx
+        container's site-confs.
+  \item[\code{deploy/deployment-guide.tex}] Source for this PDF. Edit it and recompile rather than
+        editing the PDF directly.
+  \item[\code{Dockerfile}] Multi-stage Rust build (cargo-chef) producing a slim runtime image.
+\end{description}
+
+\section*{4.\quad Step 1 --- Copy the code to the server}
+From the development machine, in the project directory:
+\begin{lstlisting}
+rsync -avz --delete \
+  --exclude target/ --exclude .git/ --exclude /data/ --exclude .env \
+  ./ user@homeserver:/srv/gif-server/
+\end{lstlisting}
+Excludes the build cache, git history, server-side GIF data, and the env file. Run once with
+\code{-n} (dry run) first to preview, then without.
+
+\begin{note}
+\textbf{Anchor the data-dir exclude with a leading slash} (\code{/data/}, not \code{data/}). An
+unanchored pattern matches a directory of that name \emph{anywhere} in the tree --- which is how an
+earlier \code{--exclude storage/} silently dropped the \code{src/storage/} \emph{module} and broke the
+build (\code{error[E0583]: file not found for module storage}). The runtime data dir is named
+\code{data} precisely so it cannot collide with any source directory.
+\end{note}
+
+First time: ensure the target exists and is writable by your SSH user:
+\begin{lstlisting}
+sudo mkdir -p /srv/gif-server
+sudo chown "$USER:$USER" /srv/gif-server
+\end{lstlisting}
+
+\section*{5.\quad Step 2 --- Create the production \texttt{.env} on the server}
+At \code{/srv/gif-server/.env} (it is not rsynced, so create it fresh). Generate secrets with
+\code{openssl rand}:
+\begin{lstlisting}
+POSTGRES_PASSWORD=<openssl rand -hex 24>
+SESSION_SECRET=<openssl rand -hex 32>
+BASE_URL=https://gifs.example.com
+MATRIX_SERVER_NAME=matrix.example.com
+MATRIX_FEDERATION_URL=https://matrix.example.com
+MATRIX_ADMIN_MXIDS=@admin:matrix.example.com
+CORS_ALLOWED_ORIGINS=https://<your-frontend-origin>
+# Optional: override host-published ports only if they clash with other
+# host services (the app/nginx use the internal network, not these).
+DB_HOST_PORT=5433
+APP_HOST_PORT=8848
+\end{lstlisting}
+\begin{itemize}[nosep]
+  \item \code{DATABASE_URL} is \textbf{not} needed here --- compose builds it from
+        \code{POSTGRES_PASSWORD} with host \code{db}.
+  \item \code{SESSION_SECRET} must be at least 32 characters.
+  \item \code{BASE_URL} must be the public \code{https://} URL --- it is embedded in rendition URLs.
+  \item \code{MATRIX_FEDERATION_URL} is where the homeserver's federation API is reachable. If the
+        server delegates federation to port 443 via \code{.well-known/matrix/server}, this is just
+        \code{https://<server-name>} (no \code{:8448}).
+  \item \code{DB_HOST_PORT} / \code{APP_HOST_PORT} set the host ports the db and app containers
+        publish on \code{127.0.0.1} (defaults \code{5432} / \code{8847}). Nothing in the running
+        system depends on them --- the app reaches Postgres at \code{db:5432} and nginx reaches the
+        app at \code{gif-server:8847}, both over the internal network --- so override them only to
+        dodge a host-side port clash. If you change \code{APP_HOST_PORT}, adjust the host-side
+        \code{curl .../health} checks accordingly.
+  \item \code{STORAGE_MAX_BYTES} / \code{PER_USER_STORAGE_BYTES} fall back to defaults (10GB / 1GB)
+        if omitted.
+\end{itemize}
+
+\begin{note}
+Create \code{.env} \textbf{before} the first \code{docker compose up}. Required variables use
+\code{${VAR:?}} markers, so compose fails loudly (by design) if any are missing.
+\end{note}
+
+\section*{6.\quad Step 3 --- Build and start the stack}
+\begin{lstlisting}
+cd /srv/gif-server
+docker compose up -d --build
+docker compose logs -f app          # watch migrations apply + startup
+curl -fsS http://127.0.0.1:8847/health   # expect HTTP 200 from the host
+\end{lstlisting}
+A clean boot logs the migrations (\code{001_init.sql}, \code{002_hidden.sql}) then
+``listening on 0.0.0.0:8847''.
+
+\section*{7.\quad Step 4 --- Wire up the nginx network and site}
+\textbf{Network.} If \code{docker compose up} fails with
+\code{network nginx declared as external, but could not be found}, point the compose network block
+at the real network name reported by \code{docker network ls}:
+\begin{lstlisting}
+# docker-compose.yml
+networks:
+  default:
+  nginx:
+    external: true
+    name: nginx_default     # <-- the actual network the nginx container is on
+\end{lstlisting}
+Alternatively, create a network literally named \code{nginx} and attach the container:
+\begin{lstlisting}
+docker network create nginx
+docker network connect nginx <nginx-container>
+\end{lstlisting}
+
+\textbf{Site.} Copy \code{deploy/nginx.conf.example} into the nginx container's site-confs directory
+on the host:
+\begin{lstlisting}
+cp /srv/gif-server/deploy/nginx.conf.example \
+  /docker/apps/nginx/nginx/site-confs/gif-server.conf
+\end{lstlisting}
+Edit it: set the real \code{server_name} and the container-internal TLS cert paths. Key points
+already baked into the template:
+\begin{itemize}[nosep]
+  \item Proxies to \code{http://gif-server:8847} using Docker's embedded DNS resolver
+        (\code{127.0.0.11}) and a variable upstream, so an app restart doesn't strand nginx on a
+        stale IP.
+  \item \code{client_max_body_size 50m;} --- matches the app's 50 MB upload limit (nginx defaults to
+        1 MB).
+  \item Overwrites \code{X-Forwarded-For} / \code{X-Real-IP} with \code{$remote_addr}.
+\end{itemize}
+Then validate and reload nginx:
+\begin{lstlisting}
+docker exec <nginx-container> nginx -t
+docker exec <nginx-container> nginx -s reload
+curl -fsS https://gifs.example.com/health   # expect HTTP 200 over TLS
+\end{lstlisting}
+
+\section*{8.\quad Step 5 --- Verify}
+\begin{itemize}[nosep]
+  \item \textbf{App resolvable from nginx:} \code{docker exec <nginx-container> getent hosts gif-server}
+        returns an IP.
+  \item \textbf{Real client IPs:} nginx access logs show public client IPs, not \code{172.x} gateway
+        addresses --- confirms the per-IP rate limiter keys on real clients.
+  \item \textbf{Auth path:} \code{POST /auth/matrix} with a real Matrix OpenID token returns a JWT;
+        bad tokens return 401 (not 500).
+\end{itemize}
+
+\begin{note}
+\textbf{Security --- X-Forwarded-For.} The auth rate limiter trusts the leftmost
+\code{X-Forwarded-For} value. nginx must \textbf{overwrite} it with \code{$remote_addr} (the template
+does), \textbf{not} append via \code{$proxy_add_x_forwarded_for} --- appending would let a client
+prepend a spoofed IP and bypass the per-IP login limiter. The app must remain reachable only through
+nginx (it is: localhost bind + internal network, never publicly published). A non-spoofable global
+auth cap ($\sim$5 req/s) bounds total login load as a second layer.
+\end{note}
+
+\section*{9.\quad Local development (unchanged)}
+Local dev runs the app on the host against the dockerized db:
+\begin{lstlisting}
+./scripts/dev.sh          # starts db via compose, waits healthy, runs cargo run
+# or, if db is already up:
+cargo run
+curl -i http://localhost:8847/health
+\end{lstlisting}
+\begin{itemize}[nosep]
+  \item The app reads the local \code{.env} (localhost DB URL, localhost base URL).
+  \item \code{docker compose up -d db} works locally despite the external nginx network (only the
+        app service references it).
+  \item Running the \textbf{full} stack locally (\code{docker compose up}) requires the network to
+        exist: \code{docker network create nginx} first.
+\end{itemize}
+
+\section*{10.\quad Routine operations}
+\begin{description}[style=nextline,nosep,leftmargin=0pt]
+  \item[Redeploy after code change] rsync (Step 1), then \code{docker compose up -d --build}
+  \item[View app logs] \code{docker compose logs -f app}
+  \item[Restart app only] \code{docker compose restart app}
+  \item[Stop everything] \code{docker compose down} (data persists in the postgres\_data volume)
+\end{description}
+
+\begin{note}
+GIF files live in the host bind mount \code{/srv/gif-server/data} and are root-owned (the container
+runs as root). Back up that directory plus the Postgres volume.
+\end{note}
+
+\section*{11.\quad Troubleshooting}
+\begin{description}[style=nextline,leftmargin=0pt]
+  \item[\code{error[E0583]: file not found for module storage} (plus a cascade of \code{E0282})]
+        The \code{src/storage/} module never reached the server. Cause: an unanchored rsync exclude
+        (\code{storage/}) matching the source dir. Fix: use \code{--exclude /data/} (the data dir is
+        named \code{data}, so it no longer collides), and confirm \code{src/storage/} is present on
+        the server before building.
+  \item[\code{Bind for 0.0.0.0:5432 failed: port is already allocated}]
+        Another Postgres on the host already owns the published port. Set \code{DB_HOST_PORT} in the
+        server's \code{.env} to a free port (e.g.\ 5433). The app is unaffected --- it uses the
+        internal \code{db:5432}, not the host port.
+  \item[\code{network nginx declared as external, but could not be found}]
+        No Docker network with that exact name exists. Set the \code{name:} field of the compose
+        network block to the real network (Section 7), or create/attach a network literally named
+        \code{nginx}.
+\end{description}
+
+\end{document}

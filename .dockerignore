@@ -1,4 +1,6 @@
 target/
-storage/
+# Runtime GIF data dir (host bind mount). Named `data` so it can't collide
+# with the src/storage/ module the way a shared `storage` name would.
+/data/
 .env
 *.md

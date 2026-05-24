@@ -1,6 +1,6 @@
 /target
 .env
-/storage/
+/data/
 *.pem
 *.key
 *.cert
