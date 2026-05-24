@@ -101,5 +101,14 @@ async fn main() {
     tracing::info!("listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app.into_make_service()).await.unwrap();
+    // Serve with ConnectInfo so the rate limiter's SmartIpKeyExtractor can fall
+    // back to the TCP peer address when no X-Forwarded-For header is present
+    // (e.g. direct local requests). Without it, key extraction fails and the
+    // auth per-IP limiter 500s every request.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

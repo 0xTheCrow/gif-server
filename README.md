@@ -97,7 +97,7 @@ All configuration is via environment variables (or `.env`):
 | `SESSION_SECRET` | — | HMAC secret for signing session tokens (required, min 32 chars) |
 | `STORAGE_MAX_BYTES` | `10GB` | Max total rendition bytes across all users; suffix `KB`/`MB`/`GB`/`TB`, `0` disables |
 | `PER_USER_STORAGE_BYTES` | `1GB` | Max rendition bytes per uploader; same suffixes, `0` disables |
-| `CORS_ALLOWED_ORIGINS` | _(empty)_ | Comma-separated allowed browser origins (e.g. `https://durnible.example.com`). Empty allows any origin with a startup warning — set this in production |
+| `CORS_ALLOWED_ORIGINS` | _(empty)_ | Comma-separated allowed browser origins (e.g. `https://app.example.com`). Empty allows any origin with a startup warning — set this in production |
 
 Set `BASE_URL` to your public domain in production (e.g. `https://gifs.example.com`).
 

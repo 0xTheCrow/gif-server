@@ -22,7 +22,7 @@ pub struct Config {
     pub storage_max_bytes: u64,
     /// Per-uploader storage ceiling. A user's uploads may not exceed this.
     pub per_user_storage_bytes: u64,
-    /// Allowed CORS origins (exact, e.g. https://durnible.example.com).
+    /// Allowed CORS origins (exact, e.g. https://app.example.com).
     /// Empty means "allow any origin" (with a startup warning).
     pub cors_allowed_origins: Vec<String>,
 }
