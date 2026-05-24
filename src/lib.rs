@@ -53,10 +53,14 @@ pub struct AppState {
 /// limit (it's unauthenticated and triggers an outbound homeserver call).
 /// Limits are generous enough not to throttle the test suite.
 pub fn create_router(state: AppState) -> Router {
+    // NOTE: tower_governor's `per_second(n)` sets the *replenish interval* to n
+    // seconds (one token every n seconds), NOT n requests/second. To express a
+    // sustained rate of R req/s, use `per_millisecond(1000 / R)`. `burst_size`
+    // is the bucket capacity (max instantaneous burst).
     let per_user_rate_limit = Arc::new(
         GovernorConfigBuilder::default()
             .key_extractor(MxidKeyExtractor)
-            .per_second(30)
+            .per_millisecond(33) // ~30 req/s sustained
             .burst_size(60)
             .finish()
             .expect("invalid per-user rate-limit config"),
@@ -67,7 +71,7 @@ pub fn create_router(state: AppState) -> Router {
     let file_rate_limit = Arc::new(
         GovernorConfigBuilder::default()
             .key_extractor(MxidKeyExtractor)
-            .per_second(200)
+            .per_millisecond(5) // 200 req/s sustained
             .burst_size(1000)
             .finish()
             .expect("invalid file rate-limit config"),
@@ -78,7 +82,7 @@ pub fn create_router(state: AppState) -> Router {
     let suggest_rate_limit = Arc::new(
         GovernorConfigBuilder::default()
             .key_extractor(MxidKeyExtractor)
-            .per_second(50)
+            .per_millisecond(20) // 50 req/s sustained
             .burst_size(200)
             .finish()
             .expect("invalid suggest rate-limit config"),
@@ -97,7 +101,7 @@ pub fn create_router(state: AppState) -> Router {
     let auth_global_rate_limit = Arc::new(
         GovernorConfigBuilder::default()
             .key_extractor(GlobalKeyExtractor)
-            .per_second(5)
+            .per_millisecond(200) // 5 req/s sustained
             .burst_size(20)
             .finish()
             .expect("invalid auth global rate-limit config"),
@@ -105,7 +109,7 @@ pub fn create_router(state: AppState) -> Router {
     let auth_per_ip_rate_limit = Arc::new(
         GovernorConfigBuilder::default()
             .key_extractor(SmartIpKeyExtractor)
-            .per_second(1)
+            .per_second(1) // 1 req/s sustained (per_second(1) == per_millisecond(1000))
             .burst_size(5)
             .finish()
             .expect("invalid auth per-IP rate-limit config"),
