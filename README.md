@@ -56,7 +56,7 @@ Obtain a session token by posting a Matrix OpenID token (from
 curl -X POST http://localhost:8847/auth/matrix \
   -H 'Content-Type: application/json' \
   -d '{"access_token":"<openid-token>","matrix_server_name":"example.com"}'
-# => { "token": "<session-jwt>", "mxid": "@you:example.com", "expires_in": 3600 }
+# => { "token": "<session-jwt>", "mxid": "@you:example.com", "expires_in": 3600, "is_admin": false }
 
 curl -H "Authorization: Bearer <session-jwt>" http://localhost:8847/gifs/search
 ```
@@ -115,10 +115,12 @@ Content-Type: application/json
 { "access_token": "<matrix openid token>", "matrix_server_name": "example.com" }
 ```
 
-Returns `{ "token": "<jwt>", "mxid": "...", "expires_in": 3600 }`. The token
-is verified against the homeserver's federation OpenID userinfo endpoint. Send
-the returned JWT as `Authorization: Bearer <jwt>` on every other endpoint;
-re-exchange a fresh OpenID token when it expires.
+Returns `{ "token": "<jwt>", "mxid": "...", "expires_in": 3600, "is_admin": false }`.
+The token is verified against the homeserver's federation OpenID userinfo
+endpoint. `is_admin` reflects whether the mxid is listed in `MATRIX_ADMIN_MXIDS`,
+letting clients decide whether to surface admin UI. Send the returned JWT as
+`Authorization: Bearer <jwt>` on every other endpoint; re-exchange a fresh
+OpenID token when it expires.
 
 ## API
 
