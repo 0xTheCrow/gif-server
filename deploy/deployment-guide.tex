@@ -118,15 +118,20 @@ rsync -avz --delete \
   --exclude target/ --exclude .git/ --exclude /data/ --exclude .env \
   ./ user@homeserver:/srv/gif-server/
 \end{lstlisting}
-Excludes the build cache, git history, server-side GIF data, and the env file. Run once with
+Excludes the build cache, git history, the local dev data dir, and the env file. Run once with
 \code{-n} (dry run) first to preview, then without.
 
 \begin{note}
-\textbf{Anchor the data-dir exclude with a leading slash} (\code{/data/}, not \code{data/}). An
-unanchored pattern matches a directory of that name \emph{anywhere} in the tree --- which is how an
-earlier \code{--exclude storage/} silently dropped the \code{src/storage/} \emph{module} and broke the
-build (\code{error[E0583]: file not found for module storage}). The runtime data dir is named
-\code{data} precisely so it cannot collide with any source directory.
+\textbf{Production GIF storage lives outside the deploy dir} --- it is a bind mount to the host path
+in \code{STORAGE_HOST_PATH} (set it to \code{/srv/gif-data}, a sibling of \code{/srv/gif-server}).
+Because that path is not under the rsync target, a \code{--delete} deploy cannot reach it regardless
+of excludes; because it is a bind mount and not a Docker volume, \code{docker compose down -v},
+\code{docker volume prune}, and \code{docker volume rm} cannot reach it either. Only an explicit
+\code{rm} on \code{/srv/gif-data} deletes it. The \code{--exclude /data/} above is now only hygiene,
+skipping the git-ignored local dev data dir so it is not pushed. Still anchor directory excludes with
+a leading slash (\code{/data/}, not \code{data/}): an earlier unanchored \code{--exclude storage/}
+silently dropped the \code{src/storage/} \emph{module} and broke the build (\code{error[E0583]: file
+not found for module storage}).
 \end{note}
 
 First time: ensure the target exists and is writable by your SSH user:
@@ -265,12 +270,17 @@ curl -i http://localhost:8847/health
   \item[Redeploy after code change] rsync (Step 1), then \code{docker compose up -d --build}
   \item[View app logs] \code{docker compose logs -f app}
   \item[Restart app only] \code{docker compose restart app}
-  \item[Stop everything] \code{docker compose down} (data persists in the postgres\_data volume)
+  \item[Stop everything] \code{docker compose down} --- GIF files are unaffected (they are a host
+        bind mount, not a Docker volume); the \code{postgres\_data} volume also persists. \code{down
+        -v} deletes \code{postgres\_data} but still cannot touch the bind-mounted GIF files.
 \end{description}
 
 \begin{note}
-GIF files live in the host bind mount \code{/srv/gif-server/data} and are root-owned (the container
-runs as root). Back up that directory plus the Postgres volume.
+GIF files live on the host at \code{STORAGE_HOST_PATH} (\code{/srv/gif-data} in production),
+root-owned (the container runs as root). The DB lives in the \code{postgres\_data} Docker volume.
+Back up both by running \code{./deploy/backup.sh} on the server; it writes a timestamped
+\code{gif-storage.tgz} + \code{gifserver-db.sql.gz} under \code{/srv/gif-backups} and deletes
+nothing. Copy those off the box for real durability.
 \end{note}
 
 \section*{11.\quad Troubleshooting}

@@ -116,7 +116,7 @@ pub fn create_router(state: AppState) -> Router {
     );
 
     let files = Router::new()
-        .route("/gifs/{id}/file", get(routes::fetch::serve_file))
+        .route("/gifs/{id}/file", get(routes::fetch::serve_file).put(routes::fetch::replace_file))
         .layer(GovernorLayer::new(file_rate_limit))
         .layer(axum_middleware::from_fn_with_state(
             state.clone(),

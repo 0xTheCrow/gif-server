@@ -2380,3 +2380,190 @@ async fn repeated_select_counts_uses_once_per_user(pool: PgPool) {
     .await;
     assert_eq!(json["uses"], 2); // TEST_USER once + TEST_OTHER once
 }
+
+// ---------------------------------------------------------------------------
+// Replace file tests (PUT /gifs/{id}/file)
+// ---------------------------------------------------------------------------
+
+fn replace_req(token: &str, id: &str, gif: &[u8], boundary: &str) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(format!("/gifs/{}/file", id))
+        .header("Authorization", token)
+        .header("Content-Type", format!("multipart/form-data; boundary={}", boundary))
+        .body(Body::from(multipart_body(gif, None, boundary)))
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn replace_swaps_file_and_keeps_metadata(pool: PgPool) {
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+
+    // Owner uploads a 100x80x3 GIF with tags.
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::post("/gifs")
+                .header("Authorization", bearer(TEST_USER))
+                .header("Content-Type", "multipart/form-data; boundary=ru")
+                .body(Body::from(multipart_body(&make_gif(100, 80, 3), Some("cat,meme"), "ru")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::CREATED);
+    let id = body_json(upload.into_body()).await["id"].as_str().unwrap().to_string();
+
+    // Replace it with a different 60x40x1 GIF.
+    let new_gif = make_gif(60, 40, 1);
+    let res = app
+        .clone()
+        .oneshot(replace_req(&bearer(TEST_USER), &id, &new_gif, "rr"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let json = body_json(res.into_body()).await;
+
+    // Same row: id, uploader, and tags survive; content metadata updates.
+    assert_eq!(json["id"].as_str().unwrap(), id);
+    assert_eq!(json["uploader_id"], TEST_USER);
+    assert_eq!(json["frame_count"], 1);
+    assert_eq!(json["duration_ms"], 100);
+    assert_eq!(json["renditions"]["original"]["width"], 60);
+    let tags = json["tags"].as_array().unwrap();
+    assert!(tags.contains(&Value::String("cat".into())));
+    assert!(tags.contains(&Value::String("meme".into())));
+
+    // The served original is now the new bytes, verbatim.
+    let file = app
+        .oneshot(
+            Request::get(format!("/gifs/{}/file", id))
+                .header("Authorization", bearer(TEST_USER))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(file.status(), StatusCode::OK);
+    let bytes = file.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(bytes.as_ref(), new_gif.as_slice());
+}
+
+#[sqlx::test]
+async fn replace_with_invalid_file_returns_400(pool: PgPool) {
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+    let id = upload_gif(&app, &bearer(TEST_USER), &make_gif(40, 40, 1), "ri").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = app
+        .oneshot(replace_req(&bearer(TEST_USER), &id, b"not a gif", "rib"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test]
+async fn replace_exceeding_quota_returns_507(pool: PgPool) {
+    // Wide-margin cap: a tiny 16x16x1 GIF fits, a 256x256x200 GIF does not.
+    // Both directions are asserted, so a mis-sized cap fails loudly rather
+    // than passing vacuously.
+    let (state, _dir) = make_state_with_cap(pool, 5_000);
+    let app = create_router(state);
+
+    let small = app
+        .clone()
+        .oneshot(
+            Request::post("/gifs")
+                .header("Authorization", bearer(TEST_USER))
+                .header("Content-Type", "multipart/form-data; boundary=rq")
+                .body(Body::from(multipart_body(&make_gif(16, 16, 1), None, "rq")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(small.status(), StatusCode::CREATED);
+    let id = body_json(small.into_body()).await["id"].as_str().unwrap().to_string();
+
+    let res = app
+        .oneshot(replace_req(&bearer(TEST_USER), &id, &make_gif(256, 256, 200), "rqr"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::INSUFFICIENT_STORAGE);
+}
+
+#[sqlx::test]
+async fn replace_with_existing_owned_content_returns_409(pool: PgPool) {
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+
+    let target = upload_gif(&app, &bearer(TEST_USER), &make_gif(40, 40, 1), "rc1").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let other_gif = make_gif(50, 50, 2);
+    upload_gif(&app, &bearer(TEST_USER), &other_gif, "rc2").await;
+
+    // Replacing `target` with bytes the user already owns collides on
+    // (uploader_id, hash).
+    let res = app
+        .oneshot(replace_req(&bearer(TEST_USER), &target, &other_gif, "rc3"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+}
+
+#[sqlx::test]
+async fn replace_forbidden_for_non_owner_allowed_for_admin_on_shared(pool: PgPool) {
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+    let id = upload_gif(&app, &bearer(TEST_USER), &make_gif(40, 40, 1), "rf1").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Non-owner, non-admin cannot replace.
+    let forbidden = app
+        .clone()
+        .oneshot(replace_req(&bearer(TEST_OTHER), &id, &make_gif(48, 48, 1), "rf2"))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    // Admin can replace a shared GIF it doesn't own.
+    let admin = app
+        .oneshot(replace_req(&bearer(TEST_ADMIN), &id, &make_gif(48, 48, 1), "rf3"))
+        .await
+        .unwrap();
+    assert_eq!(admin.status(), StatusCode::OK);
+}
+
+#[sqlx::test]
+async fn replace_on_other_users_private_gif_is_404(pool: PgPool) {
+    let (state, _dir) = make_state(pool);
+    let app = create_router(state);
+
+    // Owner uploads a private GIF.
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::post("/gifs")
+                .header("Authorization", bearer(TEST_USER))
+                .header("Content-Type", "multipart/form-data; boundary=rp")
+                .body(Body::from(multipart_vis(&make_gif(40, 40, 1), "private", "rp")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let id = body_json(upload.into_body()).await["id"].as_str().unwrap().to_string();
+
+    // Even an admin can't reach another user's private GIF — 404, not 403.
+    let res = app
+        .oneshot(replace_req(&bearer(TEST_ADMIN), &id, &make_gif(48, 48, 1), "rpr"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}

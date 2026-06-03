@@ -81,7 +81,7 @@ pub async fn upload(
     if let Some(existing) =
         db::get_gif_by_hash_for_uploader(&state.pool, &hash, &user.mxid).await?
     {
-        let renditions = build_renditions(&state, &existing.id).await?;
+        let renditions = build_renditions(&state, &existing.id, &existing.hash).await?;
         let tags = db::get_tags(&state.pool, &existing.id).await?;
         return Ok((StatusCode::OK, Json(to_response(existing, tags, renditions, &state.config.base_url))));
     }
@@ -148,7 +148,7 @@ pub async fn upload(
     ).await? {
         db::UploadOutcome::QuotaExceeded => return Err(AppError::InsufficientStorage),
         db::UploadOutcome::Duplicate(existing) => {
-            let renditions = build_renditions(&state, &existing.id).await?;
+            let renditions = build_renditions(&state, &existing.id, &existing.hash).await?;
             let tags = db::get_tags(&state.pool, &existing.id).await?;
             return Ok((StatusCode::OK, Json(to_response(existing, tags, renditions, &state.config.base_url))));
         }
@@ -172,27 +172,31 @@ pub async fn upload(
         return Err(e);
     }
 
-    let renditions = build_renditions(&state, &id).await?;
+    let renditions = build_renditions(&state, &id, &gif.hash).await?;
     Ok((StatusCode::CREATED, Json(to_response(gif, tags, renditions, &state.config.base_url))))
 }
 
-pub async fn build_renditions_pub(state: &AppState, gif_id: &str) -> Result<HashMap<String, RenditionInfo>, AppError> {
-    build_renditions(state, gif_id).await
+pub async fn build_renditions_pub(state: &AppState, gif_id: &str, hash: &str) -> Result<HashMap<String, RenditionInfo>, AppError> {
+    build_renditions(state, gif_id, hash).await
 }
 
-async fn build_renditions(state: &AppState, gif_id: &str) -> Result<HashMap<String, RenditionInfo>, AppError> {
+async fn build_renditions(state: &AppState, gif_id: &str, hash: &str) -> Result<HashMap<String, RenditionInfo>, AppError> {
     let rows = db::get_renditions(&state.pool, gif_id).await?;
+    // Content version in the URL so a replaced GIF gets a fresh URL and caches
+    // (browser, service worker, client object-URLs) miss instead of serving
+    // the old bytes. Changes whenever the content hash changes.
+    let version = &hash[..hash.len().min(16)];
     Ok(rows.into_iter().map(|r| {
-        let url = rendition_url(&state.config.base_url, gif_id, &r.rendition);
+        let url = rendition_url(&state.config.base_url, gif_id, &r.rendition, version);
         (r.rendition, RenditionInfo { url, width: r.width, height: r.height, size_bytes: r.size_bytes })
     }).collect())
 }
 
-fn rendition_url(base_url: &str, gif_id: &str, rendition: &str) -> String {
+fn rendition_url(base_url: &str, gif_id: &str, rendition: &str, version: &str) -> String {
     if rendition == "original" {
-        format!("{}/gifs/{}/file", base_url, gif_id)
+        format!("{}/gifs/{}/file?v={}", base_url, gif_id, version)
     } else {
-        format!("{}/gifs/{}/file?rendition={}", base_url, gif_id, rendition)
+        format!("{}/gifs/{}/file?rendition={}&v={}", base_url, gif_id, rendition, version)
     }
 }
 

@@ -77,6 +77,13 @@ pub enum UploadOutcome {
     QuotaExceeded,
 }
 
+pub enum ReplaceOutcome {
+    Updated(Gif),
+    /// The new content hashes to a GIF this uploader already owns.
+    Duplicate,
+    QuotaExceeded,
+}
+
 /// Fixed advisory-lock id; all uploads serialize their accounting on it.
 const UPLOAD_LOCK_ID: i64 = 0x6749_4653;
 
@@ -168,6 +175,96 @@ pub async fn insert_gif_quota(
 
     tx.commit().await?;
     Ok(UploadOutcome::Inserted(gif))
+}
+
+/// Replace an existing GIF's content in place: recompute its hash and metadata
+/// and overwrite its three rendition rows (keeping their filenames, so the
+/// on-disk files are overwritten, not relocated). The cap check accounts for
+/// the *delta* between the old and new rendition sizes, under the same advisory
+/// lock uploads use, so a concurrent upload/replace can't race past the cap.
+/// Returns `Duplicate` if the new content matches another GIF the uploader
+/// already owns (would violate `UNIQUE (uploader_id, hash)`), `QuotaExceeded`
+/// if a cap would be exceeded, or `Updated` with the refreshed row.
+#[allow(clippy::too_many_arguments)]
+pub async fn replace_gif_quota(
+    pool: &PgPool,
+    id: &str,
+    uploader_id: &str,
+    filename: &str,
+    hash: &str,
+    frame_count: i32,
+    duration_ms: i32,
+    renditions: &[RenditionSpec],
+    global_max: u64,
+    per_user_max: u64,
+) -> Result<ReplaceOutcome, AppError> {
+    let incoming: i64 = renditions.iter().map(|r| r.size_bytes as i64).sum();
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(UPLOAD_LOCK_ID)
+        .execute(&mut *tx)
+        .await?;
+
+    if sqlx::query_as::<_, Gif>(
+        &format!("SELECT {GIF_COLS} FROM gifs WHERE uploader_id = $1 AND hash = $2 AND id <> $3")
+    )
+    .bind(uploader_id).bind(hash).bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some() {
+        return Ok(ReplaceOutcome::Duplicate);
+    }
+
+    // Bytes this GIF currently occupies; the replacement frees them and adds
+    // `incoming`, so the cap check is against the net change.
+    let (old_total,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(size_bytes),0)::BIGINT FROM gif_renditions WHERE gif_id = $1"
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let (global_total,): (i64,) =
+        sqlx::query_as("SELECT COALESCE(SUM(size_bytes),0)::BIGINT FROM gif_renditions")
+            .fetch_one(&mut *tx)
+            .await?;
+    if (global_total - old_total + incoming) as u64 > global_max {
+        return Ok(ReplaceOutcome::QuotaExceeded);
+    }
+
+    let (user_total,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(SUM(r.size_bytes),0)::BIGINT
+         FROM gif_renditions r JOIN gifs g ON g.id = r.gif_id
+         WHERE g.uploader_id = $1"
+    )
+    .bind(uploader_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if (user_total - old_total + incoming) as u64 > per_user_max {
+        return Ok(ReplaceOutcome::QuotaExceeded);
+    }
+
+    let gif = sqlx::query_as::<_, Gif>(&format!(
+        "UPDATE gifs SET filename = $1, hash = $2, frame_count = $3, duration_ms = $4
+         WHERE id = $5 RETURNING {GIF_COLS}"
+    ))
+    .bind(filename).bind(hash).bind(frame_count).bind(duration_ms).bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    for r in renditions {
+        sqlx::query(
+            "UPDATE gif_renditions SET width = $1, height = $2, size_bytes = $3
+             WHERE gif_id = $4 AND rendition = $5"
+        )
+        .bind(r.width).bind(r.height).bind(r.size_bytes).bind(id).bind(r.rendition)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(ReplaceOutcome::Updated(gif))
 }
 
 pub async fn set_visibility(pool: &PgPool, id: &str, visibility: &str) -> Result<(), AppError> {

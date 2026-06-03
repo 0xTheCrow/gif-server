@@ -47,7 +47,14 @@ services:
       PER_USER_STORAGE_BYTES: ${PER_USER_STORAGE_BYTES:-1GB}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
     volumes:
-      - ./data:/app/storage
+      # Bind mount to a host path OUTSIDE the deploy dir. In prod set
+      # STORAGE_HOST_PATH=/srv/gif-data (a sibling of /srv/gif-server); it
+      # defaults to ./data for local dev. A path outside /srv/gif-server is
+      # beyond reach of an `rsync --delete` deploy, and a bind mount — unlike a
+      # named volume — is also immune to `docker compose down -v`,
+      # `docker volume prune`, and `docker volume rm`. Only an explicit rm on
+      # the host path deletes it.
+      - ${STORAGE_HOST_PATH:-./data}:/app/storage
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8847/health"]
       interval: 10s

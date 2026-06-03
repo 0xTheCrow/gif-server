@@ -78,7 +78,11 @@ Rebuild after code changes:
 docker compose up --build app
 ```
 
-GIF files are stored in a named Docker volume (`gif_storage`) and persist across restarts.
+GIF files are stored on a host directory bind-mounted into the container
+(`STORAGE_HOST_PATH`, default `./data`). In production set it to a path outside
+the deploy dir (e.g. `/srv/gif-data`) so a `rsync --delete` deploy can't reach
+the files; a bind mount is also immune to `docker compose down -v` and
+`docker volume prune`. The files persist across restarts and rebuilds.
 
 ## Configuration
 

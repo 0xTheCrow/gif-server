@@ -25,7 +25,7 @@ pub(crate) fn encode_offset(offset: i64) -> String {
 
 pub(crate) async fn gif_to_response(state: &AppState, gif: crate::models::Gif) -> Result<GifResponse, AppError> {
     let tags = db::get_tags(&state.pool, &gif.id).await?;
-    let renditions = build_renditions_pub(state, &gif.id).await?;
+    let renditions = build_renditions_pub(state, &gif.id, &gif.hash).await?;
     Ok(to_response(gif, tags, renditions, &state.config.base_url))
 }
 

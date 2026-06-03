@@ -22,6 +22,20 @@ pub async fn write_file(storage: &str, filename: &str, data: &[u8]) -> Result<()
     Ok(())
 }
 
+/// Write via a unique temp file in the same directory, then rename over the
+/// target. The rename is atomic on a single filesystem, so a reader never sees
+/// a partially written file and a failed write can't corrupt an existing one.
+pub async fn write_file_atomic(storage: &str, filename: &str, data: &[u8]) -> Result<(), AppError> {
+    let path = file_path(storage, filename);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_file_name(format!("{}.{}.tmp", filename, uuid::Uuid::new_v4()));
+    fs::write(&tmp, data).await?;
+    fs::rename(&tmp, &path).await?;
+    Ok(())
+}
+
 pub async fn delete_file(storage: &str, filename: &str) -> Result<(), AppError> {
     let path = file_path(storage, filename);
     if path.exists() {
