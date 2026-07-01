@@ -83,6 +83,9 @@ pub struct PaginationParams {
     /// When false (default) GIFs the viewer has hidden are excluded.
     #[serde(default)]
     pub grab_hidden: bool,
+    /// When true, `featured` returns a seeded random ordering instead of the
+    /// popularity ranking. The seed is carried in `pos` so paging stays stable.
+    pub random: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

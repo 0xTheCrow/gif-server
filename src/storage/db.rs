@@ -438,6 +438,31 @@ pub async fn list_featured(
     .await?)
 }
 
+/// Like `list_featured` but ordered by a seeded deterministic hash of each
+/// GIF's id, so a given `seed` produces the same stable shuffle across paged
+/// requests (unlike `ORDER BY RANDOM()`, which would re-shuffle per call).
+/// Visibility/NSFW/hidden filtering is identical to `list_featured`.
+pub async fn list_featured_random(
+    pool: &PgPool,
+    viewer: &str,
+    mine: bool,
+    grab_nsfw: bool,
+    grab_hidden: bool,
+    limit: i64,
+    offset: i64,
+    seed: i64,
+) -> Result<Vec<Gif>, AppError> {
+    let vis = list_filters(mine, grab_nsfw, "gifs", "$3");
+    let hidden = hidden_clause(grab_hidden, "gifs", "$3");
+    Ok(sqlx::query_as::<_, Gif>(&format!(
+        "SELECT {GIF_COLS} FROM gifs WHERE {vis}{hidden}
+         ORDER BY md5($4::text || id) LIMIT $1 OFFSET $2"
+    ))
+    .bind(limit).bind(offset).bind(viewer).bind(seed)
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn list_recent(
     pool: &PgPool,
     viewer: &str,

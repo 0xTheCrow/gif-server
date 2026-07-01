@@ -23,6 +23,29 @@ pub(crate) fn encode_offset(offset: i64) -> String {
     URL_SAFE_NO_PAD.encode(offset.to_string())
 }
 
+/// Random-mode cursor: carries the shuffle seed alongside the offset (encoded
+/// `seed:offset`) so the seeded ordering stays stable as the client pages. The
+/// client treats this as an opaque token, echoing it back verbatim as `pos`.
+pub(crate) fn encode_seeded_offset(seed: i64, offset: i64) -> String {
+    URL_SAFE_NO_PAD.encode(format!("{seed}:{offset}"))
+}
+
+/// Decodes a seeded cursor from `encode_seeded_offset`. Returns `None` for an
+/// absent or non-seeded (bare offset) cursor, so the handler mints a fresh seed
+/// for the first random page.
+pub(crate) fn decode_seeded_offset(pos: Option<&str>) -> Option<(i64, i64)> {
+    let raw = pos
+        .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
+        .and_then(|b| String::from_utf8(b).ok())?;
+    let (seed, offset) = raw.split_once(':')?;
+    Some((seed.parse().ok()?, offset.parse().ok()?))
+}
+
+/// A fresh random seed for the first page of a random-ordered feed.
+fn fresh_seed() -> i64 {
+    i64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap())
+}
+
 pub(crate) async fn gif_to_response(state: &AppState, gif: crate::models::Gif) -> Result<GifResponse, AppError> {
     let tags = db::get_tags(&state.pool, &gif.id).await?;
     let renditions = build_renditions_pub(state, &gif.id, &gif.hash).await?;
@@ -79,10 +102,21 @@ pub async fn featured(
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<ListResponse>, AppError> {
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-    let offset = decode_offset(params.pos.as_deref());
 
-    let gifs = db::list_featured(&state.pool, &user.mxid, params.mine, params.grab_nsfw, params.grab_hidden, limit, offset).await?;
-    let next = if gifs.len() as i64 == limit { Some(encode_offset(offset + limit)) } else { None };
+    let (gifs, next) = if params.random == Some(true) {
+        // Recover the seed from the cursor so the shuffle stays stable across
+        // pages; the first page (no seeded cursor) mints a fresh seed.
+        let (seed, offset) = decode_seeded_offset(params.pos.as_deref())
+            .unwrap_or_else(|| (fresh_seed(), 0));
+        let gifs = db::list_featured_random(&state.pool, &user.mxid, params.mine, params.grab_nsfw, params.grab_hidden, limit, offset, seed).await?;
+        let next = if gifs.len() as i64 == limit { Some(encode_seeded_offset(seed, offset + limit)) } else { None };
+        (gifs, next)
+    } else {
+        let offset = decode_offset(params.pos.as_deref());
+        let gifs = db::list_featured(&state.pool, &user.mxid, params.mine, params.grab_nsfw, params.grab_hidden, limit, offset).await?;
+        let next = if gifs.len() as i64 == limit { Some(encode_offset(offset + limit)) } else { None };
+        (gifs, next)
+    };
 
     let mut results = Vec::with_capacity(gifs.len());
     for gif in gifs {
@@ -140,5 +174,27 @@ mod tests {
     #[test]
     fn cursor_garbage_decodes_to_zero() {
         assert_eq!(decode_offset(Some("not_valid_base64!!!")), 0);
+    }
+
+    #[test]
+    fn seeded_cursor_roundtrip() {
+        let encoded = encode_seeded_offset(-987654321, 40);
+        assert_eq!(decode_seeded_offset(Some(&encoded)), Some((-987654321, 40)));
+    }
+
+    #[test]
+    fn seeded_cursor_rejects_bare_offset() {
+        // A non-random (bare offset) cursor must not parse as seeded, so the
+        // handler mints a fresh seed for the first random page.
+        let bare = encode_offset(20);
+        assert_eq!(decode_seeded_offset(Some(&bare)), None);
+        assert_eq!(decode_seeded_offset(None), None);
+    }
+
+    #[test]
+    fn bare_decode_tolerates_seeded_cursor() {
+        // The non-random path stays robust if handed a seeded cursor.
+        let seeded = encode_seeded_offset(123, 60);
+        assert_eq!(decode_offset(Some(&seeded)), 0);
     }
 }
