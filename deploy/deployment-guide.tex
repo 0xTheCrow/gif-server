@@ -59,7 +59,7 @@
 {\Huge\bfseries gif-server --- Deployment Guide}\par
 \medskip
 {\small Self-hosted deployment to a Docker homeserver behind a containerized nginx
-reverse proxy. Generated 2026-05-24.}
+reverse proxy. Updated 2026-07-11.}
 
 \hrule
 \bigskip
@@ -106,6 +106,9 @@ real name with \code{docker network ls} (or \code{docker inspect <nginx-containe
         server and is git-ignored / not rsynced.
   \item[\code{deploy/nginx.conf.example}] Reverse-proxy server block to copy into the nginx
         container's site-confs.
+  \item[\code{deploy/backup.sh}] Backs up the GIF files + database to a timestamped folder, then
+        verifies both archives. See Section 11.
+  \item[\code{deploy/restore.sh}] Restores a backup produced by \code{backup.sh}. See Section 11.
   \item[\code{deploy/deployment-guide.tex}] Source for this PDF. Edit it and recompile rather than
         editing the PDF directly.
   \item[\code{Dockerfile}] Multi-stage Rust build (cargo-chef) producing a slim runtime image.
@@ -151,12 +154,18 @@ MATRIX_SERVER_NAME=matrix.example.com
 MATRIX_FEDERATION_URL=https://matrix.example.com
 MATRIX_ADMIN_MXIDS=@admin:matrix.example.com
 CORS_ALLOWED_ORIGINS=https://<your-frontend-origin>
+# REQUIRED in production: put the GIF files OUTSIDE the deploy dir.
+STORAGE_HOST_PATH=/srv/gif-data
 # Optional: override host-published ports only if they clash with other
 # host services (the app/nginx use the internal network, not these).
 DB_HOST_PORT=5433
 APP_HOST_PORT=8848
 \end{lstlisting}
 \begin{itemize}[nosep]
+  \item \code{STORAGE_HOST_PATH} is what puts the GIF files at \code{/srv/gif-data}, a \emph{sibling}
+        of the deploy dir. \textbf{Do not omit it.} Compose falls back to \code{./data}, which resolves
+        \emph{inside} \code{/srv/gif-server} --- the exact thing the safety note in Section 4 says the
+        production layout avoids.
   \item \code{DATABASE_URL} is \textbf{not} needed here --- compose builds it from
         \code{POSTGRES_PASSWORD} with host \code{db}.
   \item \code{SESSION_SECRET} must be at least 32 characters.
@@ -267,23 +276,56 @@ curl -i http://localhost:8847/health
 
 \section*{10.\quad Routine operations}
 \begin{description}[style=nextline,nosep,leftmargin=0pt]
-  \item[Redeploy after code change] rsync (Step 1), then \code{docker compose up -d --build}
+  \item[Redeploy after code change] rsync (Step 1), then \code{docker compose up -d --build}. The
+        \code{--build} is required: the binary is compiled \emph{into} the image, so
+        \code{docker compose restart} re-runs the \emph{old} image and will not pick up new code.
   \item[View app logs] \code{docker compose logs -f app}
-  \item[Restart app only] \code{docker compose restart app}
+  \item[Restart app only] \code{docker compose restart app} --- restarts the current image; use it to
+        clear a wedged process, \emph{not} to deploy code.
   \item[Stop everything] \code{docker compose down} --- GIF files are unaffected (they are a host
         bind mount, not a Docker volume); the \code{postgres\_data} volume also persists. \code{down
         -v} deletes \code{postgres\_data} but still cannot touch the bind-mounted GIF files.
 \end{description}
 
-\begin{note}
+\section*{11.\quad Backup and restore}
 GIF files live on the host at \code{STORAGE_HOST_PATH} (\code{/srv/gif-data} in production),
-root-owned (the container runs as root). The DB lives in the \code{postgres\_data} Docker volume.
-Back up both by running \code{./deploy/backup.sh} on the server; it writes a timestamped
-\code{gif-storage.tgz} + \code{gifserver-db.sql.gz} under \code{/srv/gif-backups} and deletes
-nothing. Copy those off the box for real durability.
+root-owned (the container runs as root). The database lives in the \code{postgres\_data} Docker
+volume. The two are coupled: rows reference GIF files by hash, so they must be captured and restored
+\textbf{together}.
+
+\textbf{Back up} (writes a new timestamped folder under \code{/srv/gif-backups}; deletes nothing):
+\begin{lstlisting}
+cd /srv/gif-server
+./deploy/backup.sh
+\end{lstlisting}
+It writes \code{gif-storage.tgz} + \code{gifserver-db.sql.gz}, then verifies both: it compares the
+archive's file list against \code{STORAGE_HOST_PATH} and checks the dump for the \code{pg_dump}
+completion marker, failing loudly if the dump is truncated. Backups are additive --- prune old ones yourself.
+
+\textbf{Restore} (destructive to current state --- see the box below):
+\begin{lstlisting}
+cd /srv/gif-server
+docker compose stop app        # restore.sh refuses to run while the app is connected
+./deploy/restore.sh latest     # or a timestamp, or an explicit path
+docker compose up -d app
+\end{lstlisting}
+\code{restore.sh} verifies the archives \emph{before} touching anything, so a corrupt backup aborts
+without disturbing live data. It then moves the current GIF dir aside to
+\code{<storage>.pre-restore-<stamp>} (it does not delete it), extracts the backup, drops and
+recreates the database, and replays the dump. Delete the preserved directory yourself once you have
+verified the result.
+
+\begin{note}
+\textbf{Restore both halves from the same folder.} Mixing a dump from one run with files from another
+leaves rows pointing at GIF files that do not exist. \textbf{The database is dropped and recreated} ---
+data written since the backup is lost. Neither script starts, stops, or recreates a container; both
+run \code{pg_dump}/\code{psql} inside the already-running \code{db} container via
+\code{docker compose exec}, and both refuse to run if \code{db} is down. \textbf{Copy backups off the
+box} --- \code{/srv/gif-backups} is out of reach of an \code{rsync --delete} deploy (it is not under
+\code{/srv/gif-server}), but it is on the same disk and does not survive hardware failure.
 \end{note}
 
-\section*{11.\quad Troubleshooting}
+\section*{12.\quad Troubleshooting}
 \begin{description}[style=nextline,leftmargin=0pt]
   \item[\code{error[E0583]: file not found for module storage} (plus a cascade of \code{E0282})]
         The \code{src/storage/} module never reached the server. Cause: an unanchored rsync exclude
