@@ -1,4 +1,4 @@
-# gif-server
+# Zoetrope GIF Server
 
 A self-hosted GIF server with tag-based search, modeled after the Tenor API. Written in Rust using axum and Postgres.
 
